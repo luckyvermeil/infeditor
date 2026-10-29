@@ -245,3 +245,10 @@ jobs:
             InfEditor-*-setup.exe
             *.deb
           generate_release_notes: true
+          # Every 0.x tag is a beta: the editor works, but pre-1.0 there is no
+          # stability promise for the file format, the shortcuts or the CLI. The
+          # Pre-release flag keeps GitHub from offering an unfinished build as
+          # the repo's default download (and keeps `/releases/latest` pointing at
+          # the last stable one); the title repeats it where the flag is not read.
+          prerelease: ${{ startsWith(github.ref_name, 'v0.') }}
+          name: ${{ startsWith(github.ref_name, 'v0.') && format('InfEditor {0} (beta)', github.ref_name) || format('InfEditor {0}', github.ref_name) }}
