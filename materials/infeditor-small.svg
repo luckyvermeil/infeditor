@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Small-size optical variant (16/20/24px) of infeditor.svg: no shadow
+       (it turns into a grey halo once the tile is three pixels wide), page and
+       caret enlarged so the white silhouette and the accent caret still read. -->
+  <defs>
+    <linearGradient id="tileS" x1="0.05" y1="0" x2="0.95" y2="1">
+      <stop offset="0" stop-color="#6f97ff"/>
+      <stop offset="0.52" stop-color="#4477f7"/>
+      <stop offset="1" stop-color="#2743b8"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#tileS)"/>
+  <path d="M64 18 H156 L210 72 V200 A22 22 0 0 1 188 222 H64 A22 22 0 0 1 42 200 V40 A22 22 0 0 1 64 18 Z" fill="#ffffff"/>
+  <path d="M156 18 L210 72 H172 A16 16 0 0 1 156 56 Z" fill="#bdd0ff"/>
+  <g fill="#3c62dc">
+    <rect x="72" y="104" width="112" height="20" rx="10"/>
+    <rect x="72" y="150" width="66" height="20" rx="10"/>
+    <rect x="72" y="196" width="94" height="20" rx="10" opacity="0.42"/>
+    <rect x="156" y="138" width="26" height="44" rx="13"/>
+  </g>
+</svg>

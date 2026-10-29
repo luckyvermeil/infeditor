@@ -1,0 +1,29 @@
+[package]
+name = "stylo_taffy"
+license = "MIT OR Apache-2.0 OR MPL-2.0"
+description = "Interop crate for the stylo and taffy crates"
+keywords = ["css", "layout"]
+version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+
+[dependencies]
+bitflags = { workspace = true }
+taffy = { workspace = true }
+style = { workspace = true }
+style_atoms = { workspace = true }
+
+[features]
+default = ["std", "block", "flexbox", "grid"]
+std = ["taffy/std"]
+block = ["taffy/block_layout"]
+flexbox = ["taffy/flexbox", "taffy/flexbox_balance"]
+grid = ["taffy/grid"]
+floats = ["taffy/float_layout"]
+# Frame-aware style getters for CSS vertical writing modes (transposes physical styles into Taffy's
+# inline/block axes). Off by default: every getter is the plain physical mapping.
+writing-mode = []

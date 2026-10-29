@@ -1,0 +1,293 @@
+use std::time::Duration;
+
+use blitz_dom::{BaseDocument, Document as _, Node};
+use log::warn;
+use style_traits::ToCss;
+
+use super::harness_test;
+use super::{
+    SubtestResult, attr_test_needs_scripts, parse_and_resolve_document, pump_net_provider,
+    pump_timers, run_document_scripts,
+};
+use crate::{SubtestCounts, TestStatus, ThreadCtx};
+
+fn status_from_bool(input: bool) -> TestStatus {
+    if input {
+        TestStatus::Pass
+    } else {
+        TestStatus::Fail
+    }
+}
+
+pub fn process_attr_test(
+    ctx: &mut ThreadCtx,
+    subtest_selector: &str,
+    html: &str,
+    relative_path: &str,
+) -> (TestStatus, SubtestCounts, Vec<SubtestResult>) {
+    let mut document = parse_and_resolve_document(ctx, html, relative_path);
+
+    // Some checkLayout tests generate their test DOM with an inline script (or
+    // run extra `test()`s of their own): for those, execute the document's
+    // scripts — which runs the real check-layout-th.js/testharness.js — and use
+    // the harness-reported results. Tests whose inline script only *calls*
+    // `checkLayout()` keep the fast no-JS path (the checkLayout checks are
+    // re-implemented natively below).
+    if attr_test_needs_scripts(&document) {
+        let mut script_document = run_document_scripts(ctx, document);
+        for error in script_document.take_js_errors() {
+            warn!("{relative_path}: {error}");
+        }
+
+        // checkLayout() calls done() on load, but testharness defers its
+        // completion callbacks through timers: run JS timers due within a
+        // short budget so the results message can arrive
+        let harness_results =
+            pump_timers(&mut script_document, Duration::from_millis(100), |doc| {
+                doc.take_messages()
+                    .iter()
+                    .find_map(|message| harness_test::parse_results(message))
+            });
+
+        // Scripts may have mutated the DOM: re-resolve and load any
+        // newly-requested resources
+        let mut doc = script_document.inner_mut();
+        doc.resolve(0.0);
+        pump_net_provider(ctx, &mut doc);
+
+        return match harness_results {
+            Some((harness_status, results)) if !results.is_empty() => {
+                harness_test::harness_outcome(harness_status, results)
+            }
+            // Harness didn't complete or reported no subtests: fall back to
+            // the native checks against the (script-mutated) document
+            _ => check_layout(&mut doc, subtest_selector),
+        };
+    }
+
+    check_layout(&mut document, subtest_selector)
+}
+
+/// Run the native re-implementation of check-layout-th.js's `checkLayout()`:
+/// one subtest per element matching `subtest_selector`, checking the
+/// `data-expected-*`/`data-offset-*`/`data-total-*` attributes of each
+/// element's subtree against the computed layout.
+fn check_layout(
+    document: &mut BaseDocument,
+    subtest_selector: &str,
+) -> (TestStatus, SubtestCounts, Vec<SubtestResult>) {
+    let Ok(subtest_roots) = document.query_selector_all(subtest_selector) else {
+        panic!("Err parsing subtest selector \"{subtest_selector}\"");
+    };
+    if subtest_roots.is_empty() {
+        warn!("No matching nodes found for subtest selector \"{subtest_selector}\"");
+        return (TestStatus::Fail, SubtestCounts::ZERO_OF_ZERO, Vec::new());
+    }
+
+    let subtest_count = subtest_roots.len() as u32;
+    let mut pass_count: u32 = 0;
+    let mut fail_count: u32 = 0;
+
+    let subtest_results: Vec<_> = subtest_roots
+        .into_iter()
+        .enumerate()
+        .map(|(idx, root_id)| {
+            let mut errors = Vec::new();
+            document.iter_subtree_mut(root_id, |node_id, doc| {
+                let node = doc.get_node(node_id).unwrap();
+                errors.extend_from_slice(&check_node_layout(node));
+            });
+
+            let has_error = !errors.is_empty();
+            if has_error {
+                fail_count += 1;
+            } else {
+                pass_count += 1;
+            }
+
+            let mut name = format!("{subtest_selector} {}", idx + 1);
+            if let Some(title) = document
+                .get_node(root_id)
+                .and_then(|node| node.attr(blitz_dom::local_name!("title")))
+                .filter(|title| !title.is_empty())
+            {
+                name.push_str(": ");
+                name.push_str(title);
+            }
+
+            SubtestResult {
+                name,
+                status: status_from_bool(!has_error),
+                errors,
+            }
+        })
+        .collect();
+
+    assert!(pass_count + fail_count == subtest_count);
+    let subtest_counts = SubtestCounts {
+        pass: pass_count,
+        total: subtest_count,
+    };
+
+    let status = subtest_counts.as_status();
+    (status, subtest_counts, subtest_results)
+}
+
+pub fn check_node_layout(node: &Node) -> Vec<String> {
+    if node.element_data().is_none() {
+        return Vec::new();
+    }
+    let layout = node.final_layout();
+
+    let client_width =
+        layout.size.width - layout.border.left - layout.border.right - layout.scrollbar_size.width;
+    let client_height = layout.size.height
+        - layout.border.top
+        - layout.border.bottom
+        - layout.scrollbar_size.height;
+
+    node.attrs()
+        .map(|attrs| {
+            attrs
+                .iter()
+                .map(|attr| {
+                    let name = attr.name.local.as_ref();
+                    let value = &attr.value;
+                    match name {
+                        "data-expected-width" => check_attr(name, value, layout.size.width),
+                        "data-expected-height" => check_attr(name, value, layout.size.height),
+                        "data-expected-padding-top" => check_attr(name, value, layout.padding.top),
+                        "data-expected-padding-bottom" => {
+                            check_attr(name, value, layout.padding.bottom)
+                        }
+                        "data-expected-padding-left" => {
+                            check_attr(name, value, layout.padding.left)
+                        }
+                        "data-expected-padding-right" => {
+                            check_attr(name, value, layout.padding.right)
+                        }
+                        "data-expected-margin-top" => check_attr(name, value, layout.margin.top),
+                        "data-expected-margin-bottom" => {
+                            check_attr(name, value, layout.margin.bottom)
+                        }
+                        "data-expected-margin-left" => check_attr(name, value, layout.margin.left),
+                        "data-expected-margin-right" => {
+                            check_attr(name, value, layout.margin.right)
+                        }
+
+                        "data-offset-x" => check_attr(name, value, node.offset_top_left().x),
+                        "data-offset-y" => check_attr(name, value, node.offset_top_left().y),
+
+                        "data-expected-client-width" => check_attr(name, value, client_width),
+                        "data-expected-client-height" => check_attr(name, value, client_height),
+                        "data-expected-scroll-width" => check_attr(
+                            name,
+                            value,
+                            client_width.max(layout.scrollable_overflow_rect.right),
+                        ),
+                        "data-expected-scroll-height" => check_attr(
+                            name,
+                            value,
+                            client_height.max(layout.scrollable_overflow_rect.bottom),
+                        ),
+                        "data-expected-bounding-client-rect-width" => {
+                            check_attr(name, value, layout.size.width)
+                        }
+                        "data-expected-bounding-client-rect-height" => {
+                            check_attr(name, value, layout.size.height)
+                        }
+                        "data-total-x" => check_attr(name, value, total_offset(node).0),
+                        "data-total-y" => check_attr(name, value, total_offset(node).1),
+                        "data-expected-display" => {
+                            let display = node
+                                .primary_styles()
+                                .map(|styles| styles.clone_display().to_css_string())
+                                .unwrap_or_default();
+                            if display == **value {
+                                Ok(())
+                            } else {
+                                Err(format!(
+                                    "assert_equals: {name} expected {value} got {display}"
+                                ))
+                            }
+                        }
+
+                        // Not a check attribute
+                        _ => Ok(()),
+                    }
+                })
+                .filter_map(|result| result.err())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn total_offset(node: &Node) -> (f32, f32) {
+    let mut x = 0.0;
+    let mut y = 0.0;
+    let mut current = node;
+    loop {
+        let layout = current.final_layout();
+        x += layout.location.x;
+        y += layout.location.y;
+        match current.layout_parent.get() {
+            Some(parent_id) => current = current.with(parent_id),
+            None => break,
+        }
+    }
+    (x, y)
+}
+
+fn check_attr(attr_name: &str, attr_val: &str, actual: f32) -> Result<(), String> {
+    let Ok(expected) = attr_val.parse::<f32>() else {
+        return Err(format!(
+            "assert_equals: failed to parse {attr_name} value {attr_val} as f32"
+        ));
+    };
+
+    let equal = assert_with_tolerance(expected, actual);
+
+    match equal {
+        true => Ok(()),
+        false => Err(format!(
+            "assert_equals: {attr_name} expected {expected} got {actual}"
+        )),
+    }
+}
+
+fn assert_with_tolerance(expected: f32, actual: f32) -> bool {
+    (actual - expected).abs() < 1.0
+}
+
+#[cfg(test)]
+mod tests {
+    use blitz_dom::DocumentConfig;
+    use blitz_html::HtmlDocument;
+
+    use super::*;
+
+    #[test]
+    fn subtest_names_include_nonempty_root_titles() {
+        let html = r#"
+            <div class="test" title="start"><span title="child"></span></div>
+            <div class="test" title="last baseline"></div>
+            <div class="test"></div>
+            <div class="test" title=""></div>
+            <div class="test" title=" "></div>
+        "#;
+        let mut document = HtmlDocument::from_html(html, DocumentConfig::default()).into();
+        let (_, _, results) = check_layout(&mut document, ".test");
+
+        let names: Vec<_> = results.iter().map(|result| result.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                ".test 1: start",
+                ".test 2: last baseline",
+                ".test 3",
+                ".test 4",
+                ".test 5:  ",
+            ]
+        );
+    }
+}

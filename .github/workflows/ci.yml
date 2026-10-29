@@ -1,0 +1,102 @@
+name: ci
+
+# Headless checks on every push and PR: formatting, lints, workspace tests.
+#
+# Three jobs, each answering a different question:
+#   * `check` (Windows) — the primary target: fmt, clippy, rustdoc, tests.
+#   * `linux` — compiles the `cfg(not(windows))` implementations and lints them
+#     (a unix-only function is invisible to clippy on Windows, so the lint runs
+#     there too), then runs the platform-neutral tests.
+#   * `macos` — the only place the `cfg(target_os = "macos")` branches are
+#     compiled at all (case-insensitive path comparison, `open -R`, …). Without
+#     it those branches could rot until a release build.
+#
+# Every cargo invocation passes `--locked`: CI must test the dependency graph in
+# `Cargo.lock`, the same one a user gets. Without it, a transitive release can
+# change the build between the PR and the merge.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  PYTHON3: python
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check --all
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Docs
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  linux:
+    # The workspace tests are headless and already platform-gated where they
+    # need to be; this both compiles the `cfg(not(windows))` implementations and
+    # runs the platform-neutral logic tests on the Linux port.
+    runs-on: ubuntu-latest
+    env:
+      # Full dev-profile debug info makes the test binaries large enough that
+      # rust-lld (the default Linux linker since Rust 1.90) can reject them with
+      # `R_X86_64_32 out of range` on ring's `.debug_macro` sections. Line
+      # tables keep panic backtraces useful and the links reliable.
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_TEST_DEBUG: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: swatinem/rust-cache@v2
+        with:
+          key: linux
+
+      # Same lints as Windows, on the other half of the `cfg` split: the unix
+      # branches of `platform` / `winshell` are dead code on the Windows runner,
+      # so clippy there can never see them.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: swatinem/rust-cache@v2
+        with:
+          key: macos
+
+      - name: Test
+        run: cargo test --workspace --locked

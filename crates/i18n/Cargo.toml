@@ -1,0 +1,12 @@
+[package]
+name = "i18n"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "UI text catalog: a compile-time complete zh/en table with a runtime language switch (zero dependencies, zero allocation for static text)"
+license = "MIT"
+
+# This crate depends on **std only**: no build script, no runtime resource
+# files, no proc macros. Text is Rust literals; a missing translation is a
+# compile error (see the macros in src/table.rs).
+[dependencies]

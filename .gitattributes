@@ -1,0 +1,31 @@
+# Line endings: LF in the repository, LF on checkout, on every platform.
+#
+# Git for Windows defaults to core.autocrlf=true, which hands back CRLF in the
+# working tree. A Windows clone then disagrees with the ubuntu-latest CI runner
+# on every line of every file, and every file looks modified after a checkout.
+# `eol=lf` overrides core.autocrlf per path, independent of the local setting.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF — they are edited on Windows and run by
+# powershell.exe / cmd / makensis on the windows-latest runner.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.nsi text eol=crlf
+
+# Binary assets: no EOL conversion, no text diff, no merge.
+*.png    binary
+*.ico    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.woff2  binary
+*.otf    binary
+*.ttf    binary
+*.msi    binary
+*.wixpdb binary
+
+# vendor/blitz is a patched copy of an upstream repository (see [patch] in
+# Cargo.toml). Keep GitHub's language bar describing InfEditor, not the ~450
+# vendored Rust files.
+vendor/** linguist-vendored

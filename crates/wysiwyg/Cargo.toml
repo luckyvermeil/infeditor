@@ -1,0 +1,52 @@
+[package]
+name = "wysiwyg"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "WYSIWYG Markdown editor as a Dioxus Native (Blitz) component"
+license = "MIT"
+
+[dependencies]
+# Dioxus Native (Blitz) — 与根包同源（同一 git rev 经 Cargo.lock 统一），并共享
+# workspace 根的 [patch."https://github.com/dioxuslabs/blitz"] vendor 副本。
+dioxus-native = { workspace = true, features = [
+    "prelude",
+    # IME 焦点经 blitz 的 autofocus 通道（同根包，见根 Cargo.toml 注释）
+    "autofocus",
+    # dangerous_inner_html 解析（本 crate 用 <style> 前缀注入内容区 CSS）
+    "html",
+    # demo（launch 式 API）的 <img> 网络加载：launch 只在 net feature 下装配
+    # blitz-net provider。组件本身不依赖它——接入 infeditor 时由宿主 shell
+    # 的 DocumentConfig.net_provider（ui::mdnet）提供。
+    "net",
+] }
+# geom 层直接读 BaseDocument 的布局/文本排版结果
+blitz-dom = { workspace = true }
+# dioxus_native_dom::NodeHandle（onmounted → 同步访问 BaseDocument）
+blitz-traits = { workspace = true }
+# 必须与 blitz-dom 解析到的 parley 完全同一 rev（类型 Layout<TextBrush> 才能互通）。
+# rev 取自根包 Cargo.lock 中 blitz 依赖的 parley 版本。
+parley = { git = "https://github.com/linebender/parley", rev = "62790943af982ad3388a3ff96cef6f90ac80a8bb" }
+# Markdown 解析（CommonMark + GFM options）；序列化（emit）自写，见 README.md
+pulldown-cmark = "0.13"
+# 行内数学公式：LaTeX → 自包含 SVG（同根包 math.rs 的被验证用法）
+latex-rust = "2.1"
+# 剪贴板（Ctrl+C/X/V 的模型侧实现；blitz 原生只管非输入元素的 Ctrl+C）
+arboard = "3"
+# 剪贴板操作必须持有 platform::clipboard::lock()：Windows 剪贴板是系统级
+# 单例，同进程多线程并发开关会损坏堆（见 platform/src/clipboard.rs 模块文档）。
+# 宿主 crate 的剪贴板路径共用同一把锁。
+platform = { workspace = true }
+# 用户可见文案（拿不到 EditorState 的库内路径用 i18n::current().tr(...)）
+i18n = { path = "../i18n" }
+# 异步定时器：deferred_sync 任务在渲染期被 poll 时必须**挂起**（渲染持有
+# borrow_mut，std::thread::sleep 自旋会死锁渲染，见 ui.rs deferred_sync 注释）
+futures-timer = "3"
+
+# `fontconfig-dlopen`: this crate depends on parley directly (geom layer), so
+# `cargo test -p wysiwyg` on Linux would otherwise link fontique against the
+# real fontconfig library and demand pkg-config + headers. The dependency is
+# feature-only — the source/rev/feature come from the workspace so it unifies
+# with the version vendor/blitz uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+fontique = { workspace = true }

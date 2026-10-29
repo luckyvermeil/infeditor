@@ -1,0 +1,49 @@
+[package]
+name = "winshell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Window + multi-window shell infrastructure: frameless Win32 window layer (ex-winframe) and Blitz popup shell framework (ex-popshell)"
+license = "MIT"
+
+[dependencies]
+# 只为类型同源：winit / raw-window-handle 全部经 dioxus-native 再导出使用——
+# blitz 系 crate 用的是同一份，`Arc<dyn Window>` / `HasWindowHandle` 若改用
+# crates.io 的 winit 会因类型不同源而无法传递。features 与根包叠加
+# （features 统一），这里声明本 crate
+# 真正用到的：prelude（组件）、autofocus（弹窗 composer 的焦点重挂）、
+# html（见 shell 模块的 document_config——dangerous_inner_html 解析）。
+dioxus-native = { workspace = true, features = [
+    "prelude",
+    "autofocus",
+    "html",
+] }
+# shell 层自建多窗口 ApplicationHandler：主窗口上下文注入与弹窗 vdom。
+blitz-shell = { workspace = true }
+# shell 层自建 shell 直接构造 DioxusDocument，需要自己接上真正的 HTML
+# 解析器——`dangerous_inner_html` 没有它会被 Dummy 解析器静默丢掉。
+blitz-html = { workspace = true }
+blitz-dom = { workspace = true }
+# anchor probe 回调签名要 blitz_traits::net::NetProvider / BaseDocument。
+blitz-traits = { workspace = true }
+
+# 文件对话框的 owner 装饰（`dialog::owned`）。rfd 0.15 在所有平台默认就是
+# 原生/xdg-portal 后端（Linux 上是纯 Rust 的 ashpd/zbus，不拖 GTK3），且 portal
+# 后端依赖默认 feature 里的 `async-std`——单独构建本 crate
+# （`cargo test -p winshell`）时不能关默认 feature，否则 rfd 的构建脚本会 panic。
+rfd = "0.15"
+# parley → fontique：fontconfig 走 dlopen，单独构建本 crate 也不需要 fontconfig
+# 开发包（源/特性继承 workspace 声明）。
+[target.'cfg(target_os = "linux")'.dependencies]
+fontique = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# win 层（frameless/snap/softkb）的 Win32 API；feature 集取原 winframe。
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,0 +1,23 @@
+[package]
+name = "ui-kit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "通用 UI 组件库（Blitz/Dioxus-Native）：按钮 / 复选框 / 单选 / 文本框 / 图标按钮 / 菜单面板 / 模态对话框 / 分隔线 + 设计令牌 + 动效 + 主题色板"
+license = "MIT"
+
+# 通用组件库：只依赖渲染器（dioxus-native/blitz）与 std——**不依赖任何应用
+# 业务概念**（EditorState / Cmd / 编辑器主题）。主题经 `Theme` 纯色板注入，
+# 应用侧用 `From` 转换喂进来（同 winshell::PopTheme 的解耦模式）。
+#
+# [patch."…blitz"] 写在 workspace 根，本 crate 自动继承 vendor 补丁。
+[dependencies]
+dioxus-native = { workspace = true, features = [
+    "prelude",
+] }
+
+# `fontconfig-dlopen` (feature-only dependency): dioxus-native → blitz-dom →
+# parley pulls fontique, so building this crate alone on Linux would otherwise
+# require the fontconfig development package. Inherited from the workspace.
+[target.'cfg(target_os = "linux")'.dependencies]
+fontique = { workspace = true }

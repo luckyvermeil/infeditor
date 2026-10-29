@@ -1,0 +1,84 @@
+[package]
+name = "browser"
+version = "0.0.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "blitz"
+path = "src/main.rs"
+
+[features]
+default = ["hybrid", "cookies", "cache", "screenshot", "apple-font-embolden", "scrollbars"]
+android-defaults = ["skia", "cookies"]
+
+screenshot = ["dep:anyrender_vello_cpu", "dep:blitz-paint", "dep:png", "dep:peniko", "dep:rfd"]
+capture = ["dep:anyrender_serialize", "dep:blitz-paint", "dep:png", "dep:peniko", "dep:rfd"]
+vello = ["dioxus-native/vello"]
+hybrid = ["dioxus-native/vello-hybrid"]
+skia = ["dioxus-native/skia"]
+skia-raster = ["skia-raster-pixels"]
+skia-raster-pixels = ["dioxus-native/skia-pixels"]
+skia-raster-softbuffer = ["dioxus-native/skia-softbuffer"]
+cpu = ["cpu-pixels"]
+cpu-pixels = ["dioxus-native/vello-cpu-pixels"]
+cpu-softbuffer = ["dioxus-native/vello-cpu-softbuffer"]
+log-times = ["log-frame-times", "log-phase-times"]
+log-frame-times = ["dioxus-native/log-frame-times"]
+log-phase-times = ["dioxus-native/log-phase-times"]
+cache = ["blitz-net/cache"]
+cookies = ["blitz-net/cookies"]
+avif = ["image/avif"]
+webp = ["image/webp"]
+# Enable JavaScript execution for loaded pages (via blitz-vibey-script's Boa-based engine)
+javascript = ["dep:blitz-vibey-script"]
+tracing = ["dioxus-native/tracing", "blitz-html/tracing", "blitz-net/tracing", "blitz-paint?/tracing", "dep:tracing-subscriber"]
+hot-reload = ["dioxus-native/hot-reload"]
+accessibility = ["dioxus-native/accessibility"]
+scrollbars = ["blitz-dom/scrollbars", "blitz-paint/scrollbars"]
+mimalloc = ["dep:mimalloc"]
+font-embolden = ["dioxus-native/font-embolden"]
+apple-font-embolden = ["dioxus-native/apple-font-embolden"]
+writing-mode = ["blitz-dom/writing-mode", "dioxus-native/writing-mode"]
+
+[dependencies]
+dioxus-native = { workspace = true, features = [
+  "svg",
+  "system-fonts",
+  "net",
+  "clipboard",
+  "prelude",
+  "hot-reload"
+] }
+blitz-traits = { workspace = true }
+blitz-dom = { workspace = true, features = ["woff", "parallel-construct", "floats", "text-transform-icu"] }
+blitz-net = { workspace = true, features = ["http2"] }
+blitz-html = { workspace = true }
+blitz-vibey-script = { workspace = true, optional = true }
+browser-persistence = { workspace = true }
+linebender_resource_handle = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+webbrowser = { workspace = true }
+winit = { workspace = true }
+image = { workspace = true, features = ["ico"] }
+usvg = { workspace = true }
+nucleo = "0.5"
+anyrender = { workspace = true }
+anyrender_serialize = { workspace = true, optional = true }
+anyrender_vello_cpu = { workspace = true, optional = true }
+blitz-paint = { workspace = true, optional = true }
+png = { workspace = true, optional = true }
+peniko = { workspace = true, optional = true }
+
+tokio = { workspace = true, features = ["time", "rt", "sync", "macros"] }
+
+# Allocators
+mimalloc = { version = "0.1.48", optional = true }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+rfd = { workspace = true, features = ["xdg-portal"], optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6.0", features = ["native-activity"] }

@@ -1,0 +1,25 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=InfEditor
+GenericName=Text Editor
+GenericName[zh_CN]=文本编辑器
+Comment=A WYSIWYG Markdown / text editor built in Rust
+Comment[zh_CN]=用 Rust 从零实现的所见即所得 Markdown / 文本编辑器
+Exec=infeditor %F
+Icon=infeditor
+Terminal=false
+Categories=Development;TextEditor;Utility;
+Keywords=text;editor;markdown;wysiwyg;
+MimeType=text/plain;text/markdown;text/x-markdown;text/html;text/csv;text/x-log;application/json;application/xml;application/yaml;application/javascript;application/x-sh;
+StartupNotify=true
+# winit derives WM_CLASS from argv[0] (the installed binary is `infeditor`)
+# and the shell matches this value case-sensitively; `InfEditor` would leave
+# the window ungrouped in the dock/taskbar.
+StartupWMClass=infeditor
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Name[zh_CN]=新建窗口
+Exec=infeditor

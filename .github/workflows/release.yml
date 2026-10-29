@@ -1,0 +1,247 @@
+name: release
+
+# Build release artifacts for every supported target and publish them as a
+# GitHub release:
+#   - Windows x64 / arm64: portable zip + MSI (WiX) + NSIS setup (x64 only)
+#   - Linux amd64: DEB (cargo-deb; the Linux port is experimental but compiles)
+#
+# The editor is Win32-first (frameless windows, registry, TrackPopupMenu) —
+# see README.md ("Windows-native") — so Linux ships as a best-effort DEB.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # stylo's build script needs a Python interpreter. `.cargo/config.toml` sets
+  # PYTHON3 without `force = true`, so this workflow-level value wins in CI.
+  PYTHON3: python
+
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag names the release; `Cargo.toml` names the binary. If they drift,
+      # every installer says 0.2.0 while `--version`, the About box and the crash
+      # log say 0.1.0 — and nothing notices until a user reports a version that
+      # does not exist. Fails before the (long) Blitz build, not after it.
+      - name: Tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $pkg = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($tag -ne "v$pkg") {
+            throw "tag $tag does not match Cargo.toml version $pkg — bump the version and re-tag"
+          }
+          Write-Host "releasing $pkg"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          # dist/ is the one place every package lands (MSI, NSIS setup, zips,
+          # DEB — see the deb job); each producing step creates it so the steps
+          # stay order-independent.
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $exe = "target/${{ matrix.target }}/release/infeditor.exe"
+          $zip = "dist/InfEditor-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path $exe -DestinationPath $zip
+          Get-Item $zip | Select-Object Name, Length
+
+      - name: Symbols zip (PDB)
+        shell: pwsh
+        run: |
+          # The release profile keeps line tables (Cargo.toml), so a user's
+          # crash.log can be resolved to file:line — but only with the matching
+          # PDB. Ship it as a separate asset: it is far too big for the
+          # portable zip, and it matches the InfEditor-*.zip patterns below so
+          # it lands in the release without extra plumbing.
+          $pdb = "target/${{ matrix.target }}/release/infeditor.pdb"
+          if (-not (Test-Path $pdb)) { throw "missing $pdb (debug info was stripped?)" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $zip = "dist/InfEditor-${{ github.ref_name }}-${{ matrix.target }}-symbols.zip"
+          Compress-Archive -Path $pdb -DestinationPath $zip
+          Get-Item $zip | Select-Object Name, Length
+
+      - name: MSI (WiX)
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = if ($tag -match '^v(\d.*)$') { $Matches[1] } else { $null }
+          packaging\windows\build-msi.ps1 `
+            -Arch $(if ('${{ matrix.target }}' -like 'aarch64*') { 'arm64' } else { 'x64' }) `
+            -BinDir "target/${{ matrix.target }}/release" `
+            -Version $ver
+
+      - name: EXE installer (NSIS, x64 only)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          # choco installs NSIS under "Program Files (x86)" and only appends to
+          # the *machine* PATH; the PATH this step was started with never
+          # changes, so a bare `makensis` stays "not recognized" (that is how the
+          # v0.1.0 release failed). Put the directory on PATH here, falling back
+          # to the literal location if the runner does not export
+          # ProgramFiles(x86).
+          choco install nsis -y --no-progress
+          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          if (-not (Test-Path (Join-Path $nsis 'makensis.exe'))) {
+            $nsis = Join-Path (Join-Path 'C:' 'Program Files (x86)') 'NSIS'
+          }
+          if (-not (Test-Path (Join-Path $nsis 'makensis.exe'))) {
+            throw 'makensis.exe not found after installing NSIS'
+          }
+          $env:PATH = "$nsis;$env:PATH"
+          $tag = "${{ github.ref_name }}"
+          $ver = if ($tag -match '^v(\d.*)$') { $Matches[1] } else {
+            (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          }
+          # Quote the version: `-DVERSION=$ver` is passed through verbatim by
+          # PowerShell (a parameter-like token is not expanded), which made
+          # makensis write "InfEditor-$ver-x64-setup.exe" and the Get-Item below
+          # look for the wrong name.
+          makensis -DVERSION="$ver" `
+            -DBINDIR="target\x86_64-pc-windows-msvc\release" `
+            -DOUTDIR=dist packaging\windows\InfEditor.nsi
+          Get-Item "dist/InfEditor-$ver-x64-setup.exe" | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InfEditor-${{ matrix.target }}
+          # upload-artifact strips the least-common-ancestor prefix (dist/),
+          # so the artifact itself is flat; the release job's `files:` globs
+          # therefore stay unprefixed.
+          path: |
+            dist/InfEditor-*.zip
+            dist/InfEditor-*.msi
+            dist/InfEditor-*-setup.exe
+
+  deb:
+    # Best-effort Linux package: the port compiles (see README "Linux") but is
+    # experimental; a CI failure here must not block the Windows artifacts.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: swatinem/rust-cache@v2
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build DEB
+        run: |
+          cargo deb
+          # Unify the output location: cargo-deb always writes target/debian/,
+          # so copy the package into the same dist/ every other artifact uses.
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InfEditor-deb-amd64
+          path: dist/*.deb
+
+  macos:
+    # Experimental platform (README): the same editor, in an unsigned .app.
+    # Both architectures are built because a Rosetta-only or Apple-Silicon-only
+    # download is a support question either way, and cross-compiling on one
+    # runner costs nothing extra — `cargo build --target` does the work.
+    #
+    # No Developer ID, so no notarization: Gatekeeper refuses the first launch
+    # on any Mac that downloaded the zip. The package carries INSTALL-macos.txt
+    # (see packaging/macos/make-app.sh) instead of pretending otherwise.
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: App bundle + zip
+        # A tag names the version; a manual run (workflow_dispatch) has none, so
+        # make-app.sh falls back to Cargo.toml — the same rule the MSI/NSIS
+        # steps apply.
+        run: |
+          bash packaging/macos/make-app.sh \
+            -t "${{ matrix.target }}" \
+            -v "$GITHUB_REF_NAME" \
+            -b "target/${{ matrix.target }}/release" \
+            -o dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InfEditor-${{ matrix.target }}
+          path: dist/InfEditor-*.zip
+
+  release:
+    # A failed `deb` or `macos` leg is tolerated (`continue-on-error` on the
+    # former, an experimental platform on the latter), but a failed dependency
+    # still skips dependent jobs by default — which would drop the Windows
+    # artifacts from the release exactly when the best-effort build breaks.
+    # `!cancelled()` keeps the job eligible after a failure; the explicit
+    # `needs.windows.result` check still requires the real artifacts. A missing
+    # .deb / macOS zip simply does not match `files` below (softprops ignores
+    # unmatched patterns).
+    needs: [windows, deb, macos]
+    if: ${{ !cancelled() && needs.windows.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            InfEditor-*.zip
+            InfEditor-*.msi
+            InfEditor-*-setup.exe
+            *.deb
+          generate_release_notes: true

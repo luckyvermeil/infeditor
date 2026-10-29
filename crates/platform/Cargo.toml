@@ -1,0 +1,38 @@
+[package]
+name = "platform"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "The single home for OS differences: locale, ANSI codepage, shared file opens, local time, file-manager reveal, shell spawn, path comparison and file association"
+license = "MIT"
+
+[dependencies]
+# Platform APIs are compiled only for the matching target; the rest are pure
+# std. The feature set is narrowed to the functions this crate actually uses
+# (Registry = file association, Shell = SHChangeNotify, Globalization =
+# GetUserDefaultUILanguage). Versions come from the workspace.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    # CreateMutexW's SECURITY_ATTRIBUTES parameter lives in the Security module,
+    # so the single-instance mutex needs the feature.
+    "Win32_Security",
+    # Get/SetNamedSecurityInfoW: copying the target file's DACL onto the temp
+    # file an atomic save replaces it with (see `create_replacement_file`).
+    "Win32_Security_Authorization",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    # AllowSetForegroundWindow: the second instance hands the foreground over
+    # to the running one before it exits (see `instance`).
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# POSIX local time. This is FFI declarations only (std already links the C
+# runtime); there is no C source to compile, so the crate stays cross-buildable
+# without a sysroot. Used by `posix::local_civil` (`localtime_r`), which is the
+# only way to honor `TZ` / `/etc/localtime` without reimplementing the tz
+# database.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

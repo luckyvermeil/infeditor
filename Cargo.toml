@@ -1,0 +1,240 @@
+# Workspace: crates/wysiwyg (WYSIWYG Markdown editor, see crates/wysiwyg/README.md).
+# [patch."…blitz"] can only be written in the workspace root (this file); sub-crates inherit the vendor patch automatically;
+# the root package infeditor coexists with the workspace; src/, tests/, and tests_py/ are left untouched.
+[workspace]
+members = ["crates/wysiwyg", "crates/winshell", "crates/ui-kit", "crates/i18n", "crates/platform"]
+# Nested workspace rules: vendor/blitz ships its own [workspace] (edition inherited from its own
+# workspace.package) — if the outer workspace did not exclude vendor, the inner workspace
+# root would be ignored and the vendor packages' `edition.workspace = true` would wrongly resolve to this file.
+exclude = ["vendor"]
+resolver = "2"
+
+# Dependency versions shared by sub-crates (each crate declares its own features, which are merged with these).
+#
+# All Blitz crates come from the same git source and the same branch: write the URL/branch here once,
+# and each crate inherits with `workspace = true`, declaring only the features it actually uses —
+# previously the URL was copied in five places; changing the branch meant remembering five spots,
+# and missing one meant two sets of blitz types from different sources
+# (`Arc<dyn Window>` could not be passed across).
+# [patch."…blitz"] matches by URL, so inherited dependencies are likewise redirected to the vendor copy.
+[workspace.dependencies]
+windows-sys = "0.59"
+dioxus-native = { git = "https://github.com/dioxuslabs/blitz", branch = "main" }
+blitz-shell = { git = "https://github.com/dioxuslabs/blitz", branch = "main" }
+blitz-html = { git = "https://github.com/dioxuslabs/blitz", branch = "main" }
+blitz-dom = { git = "https://github.com/dioxuslabs/blitz", branch = "main" }
+blitz-traits = { git = "https://github.com/dioxuslabs/blitz", branch = "main" }
+platform = { path = "crates/platform" }
+# parley's font-discovery layer (fontique), loaded through dlopen on Linux so a
+# build needs no fontconfig development package. Declared here with the feature
+# so every workspace crate that pulls it (directly or via parley) can inherit
+# the same source, rev and feature — `cargo test -p <crate>` does not build the
+# root package, so the root's target-specific dependency alone would not turn
+# the feature on for such builds (see the Linux sections below).
+fontique = { git = "https://github.com/linebender/parley", rev = "62790943af982ad3388a3ff96cef6f90ac80a8bb", features = [
+    "fontconfig-dlopen",
+] }
+
+[package]
+name = "infeditor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Text editor built from scratch in Rust with a Dioxus Native (Blitz) UI; Windows first-class, Linux/macOS experimental"
+repository = "https://github.com/luckyvermeil/infeditor"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+# Dioxus Native (Blitz) — tracked from the upstream git repository so we pick up
+# renderer/event fixes that are not yet released on crates.io.
+dioxus-native = { workspace = true, features = [
+    "prelude",
+    # focus the IME composer through blitz's own autofocus pass instead of
+    # calling MountedData::set_focus during the mount callback (which borrows
+    # the document while it is already mutably borrowed -> RefCell panic)
+    "autofocus",
+    # parse dangerous_inner_html (Markdown in-place preview / HTML dialogs). Without it
+    # DummyHtmlParserProvider silently drops the inner HTML and the preview renders blank.
+    "html",
+    # Native overlay scrollbars (css-scrollbars-1's scrollbar-color / width):
+    # containers with `overflow:auto|scroll` get a draggable thumb, hover/pressed states,
+    # and auto fade-out when idle.
+    # Without it, native scroll containers such as the sidebar/outline/dialogs "scroll but show no bar".
+    # The viewport/CSV panels are virtualized rendering + manual scroll_top (overflow:hidden) and still use
+    # our own scrollbar component — native bars are only attached to real scroll containers, so the two don't conflict.
+    "scrollbars",
+] }
+# Multi-window shell (find/replace child windows): same git source as dioxus-native, so cargo dedupes to
+# the same checkout; dioxus-native no longer exports WindowConfig/BlitzApplication types.
+blitz-shell = { workspace = true }
+# The custom shell (ui::shell) constructs DioxusDocument directly and needs to wire up a real HTML
+# parser itself — without it, `dangerous_inner_html` (Markdown in-place preview / HTML dialogs)
+# is silently dropped by the Dummy parser and renders blank.
+blitz-html = { workspace = true }
+blitz-dom = { workspace = true }
+# The custom NetProvider (ui::mdnet) implements traits from blitz-traits; the git source is
+# redirected by the [patch] below to the vendor copy, so its types share the same source as the other blitz crates
+blitz-traits = { workspace = true }
+fontdue = "0.9"
+encoding_rs = "0.8"
+chardetng = "0.1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.15"
+# Window and multi-window shell infrastructure:
+# win layer = frameless window (win32.rs/snap.rs/softkb.rs); shell layer = Bridge state bridge,
+# popup widget library, custom multi-window shell; business code plugs in via the `ui::shell` adapter layer.
+winshell = { path = "crates/winshell" }
+# Markdown WYSIWYG editor component (crates/wysiwyg/README.md): the md_wys view mode
+# routes to its `Wysiwyg` component (see ui::components::mdws).
+wysiwyg = { path = "crates/wysiwyg" }
+# UI text (Chinese / English): a compile-time complete catalog plus a runtime
+# language switch. Zero dependencies and renderer-agnostic, so `wysiwyg` and
+# `ui-kit` can use it too (see crates/i18n/README.md).
+i18n = { path = "crates/i18n" }
+# General-purpose UI component library
+# — the `From` impl for `highlight::Theme → ui_kit::Theme` in `ui::mod`.
+ui-kit = { path = "crates/ui-kit" }
+# The single home for platform differences (locale/codepage/shared open/local time/file manager/shell/
+# path comparison/file association). Host code must not contain cfg(windows) — see the
+# module docs in crates/platform.
+platform = { path = "crates/platform" }
+memmap2 = "0.9"
+unicode-width = "0.2"
+unicode-normalization = "0.1"
+# Remote images in the MD preview: lightweight blocking HTTP client (rustls, no tokio — the
+# custom NetProvider runs requests on std threads, see ui::mdnet)
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+# blitz-dom's image 0.25 is default-features=false with no decoders enabled; to unify feature
+# resolution: enabling the common formats explicitly here is what lets blitz-dom's ImageHandler::parse decode
+# PNG/JPEG/GIF/WebP (SVG goes through blitz's built-in usvg path and is unaffected by this)
+image = { version = "0.25.6", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+] }
+# LaTeX math formulas → self-contained SVG (glyphs converted to paths, STIX Two Math embedded, pure Rust offline).
+# The Markdown preview's $...$ / $$...$$ go through this; the output is handed to Blitz for rendering as inline <svg>
+# (blitz's construct.rs routes tag=="svg" through usvg; dioxus-native includes the svg feature by default).
+# Only math mode is supported; text mode/TikZ return Err — callers must fall back to rendering escaped text.
+latex-rust = "2.1"
+memchr = "2"
+# `wayland-data-control`: on a pure-Wayland session (no XWayland) the X11-only
+# backend cannot open the clipboard at all. arboard tries the wl-clipboard
+# protocol first and falls back to X11 when the compositor lacks it (GNOME),
+# so the feature is a strict superset of the default behavior. It is a
+# Linux-only dependency inside arboard; other targets ignore the feature.
+arboard = { version = "3", features = ["wayland-data-control"] }
+thiserror = "2"
+directories = "6"
+
+# The editor's right-click menu is a real Win32 popup (`TrackPopupMenu`) so it
+# can extend past the window edges. That needs the
+# windowing API directly; `windows` 0.58 (which blitz uses) has no TrackPopupMenu.
+# The remaining Win32 integrations (registry association / default language / Shell notifications) have been moved down into crates/platform,
+# and the feature set now only keeps the few items actually used by the context menu.
+[target.'cfg(windows)'.dependencies]
+# Version comes from [workspace.dependencies] (crates/winshell uses the same one)
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Linux-only dependency (zero C build dependencies for cross-compilation + no hard requirement on system
+# services at runtime).
+#
+# fontique (parley's font discovery layer) links its fontconfig backend **directly** against
+# libfontconfig by default — cross-compilation would need a sysroot + pkg-config. The
+# `fontconfig-dlopen` feature (declared on the workspace dependency above) dlopens it at runtime
+# instead; behavior is unchanged on machines that have fontconfig, and systems without it fall
+# back instead of failing to start. Same git rev as vendor/blitz's parley, so features unify.
+#
+# rfd needs no target section: 0.15 defaults to the pure-Rust xdg-portal backend on Linux, and
+# that backend needs the `async-std` feature the default set provides (see `[dependencies]`).
+[target.'cfg(target_os = "linux")'.dependencies]
+# Feature/source inherited from [workspace.dependencies]; the entry is what
+# actually turns `fontconfig-dlopen` on for this build graph.
+fontique = { workspace = true }
+
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+# Keep line tables so a crash log's backtrace resolves to file:line instead of bare
+# addresses. This is the minimum debug info (`strip = "none"` + `debug = "line-tables-only"`):
+# no variable/type info, so the size cost stays small. On Windows the symbols land in
+# the `.pdb` next to the executable — ship it beside the `.exe` to symbolize crash
+# reports from end users.
+debug = "line-tables-only"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Locally vendored blitz (content = the same commit as the git checkout) carrying **sixteen** local
+# fixes that have not landed upstream — accessible names for interactive elements (accesskit text
+# nodes only set_value, so UIA/screen readers saw empty names), hit-testing that respects overflow
+# clipping, semi-transparent selection painting, pointer/click focus and touch-slop behaviour,
+# IME commit → keydown, stale ids in the cached paint tree, and a few more.
+#
+# `vendor/blitz/INFEDITOR-PATCH.md` is the authoritative list: one section per patch with the
+# problem, the change and its verification, plus what to delete once upstream ships the fix.
+# Keep the count in sync with that file when adding a patch.
+# Once every patch is upstream, this whole section can be removed in favor of the git dependencies.
+[patch."https://github.com/dioxuslabs/blitz"]
+accesskit_xplat = { path = "vendor/blitz/packages/accesskit_xplat" }
+debug_timer = { path = "vendor/blitz/packages/debug_timer" }
+blitz-traits = { path = "vendor/blitz/packages/blitz-traits" }
+blitz-dom = { path = "vendor/blitz/packages/blitz-dom" }
+blitz-html = { path = "vendor/blitz/packages/blitz-html" }
+blitz-net = { path = "vendor/blitz/packages/blitz-net" }
+blitz-paint = { path = "vendor/blitz/packages/blitz-paint" }
+blitz-shell = { path = "vendor/blitz/packages/blitz-shell" }
+stylo_taffy = { path = "vendor/blitz/packages/stylo_taffy" }
+dioxus-native = { path = "vendor/blitz/packages/dioxus-native" }
+dioxus-native-dom = { path = "vendor/blitz/packages/dioxus-native-dom" }
+
+# NOTE: formulas use the **crates.io** `latex-rust` (see [workspace.dependencies]) —
+# the locally vendored copy and the features added on top of it (the CJK
+# fallback face wired in `wysiwyg::math`, fed by `platform::cjk_font_candidates`)
+# have been removed. Consequence: a CJK character inside `\text{…}` /
+# `\mathrm{…}` fails at the engine with `missing glyph` and the whole formula
+# takes the literal-text fallback; every formula shape the upstream engine
+# supports (ASCII `$…$` / `$$…$$`, boxed, gathered→array, \downarrow, mhchem
+# `\ce{…}`) is unaffected. If CJK-in-formula is ever needed again, the vendor
+# patch lives in git history (vendor/latex-rust, removed in the de-vendor commit).
+
+# ---- Linux DEB packaging (cargo-deb; built in CI on ubuntu, see release.yml) ----
+# The renderer is pure Rust (blitz), so $auto only picks the usual X11/wayland
+# runtime libs; fontconfig is dlopen'd at runtime (fontconfig-dlopen feature).
+[package.metadata.deb]
+maintainer = "InfEditor Developers <luckyvermeil@users.noreply.github.com>"
+copyright = "2026 luckyvermeil"
+extended-description = """InfEditor is a text editor built from scratch in Rust with a Dioxus Native (Blitz) UI.
+
+WYSIWYG Markdown editing, syntax highlighting, CSV/JSON views, LaTeX math to SVG,
+Vim mode, and a frameless Win32-native shell on Windows; Linux is experimental."""
+depends = "$auto"
+section = "editors"
+priority = "optional"
+assets = [
+    ["target/release/infeditor", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/infeditor/", "644"],
+    ["README.zh-CN.md", "usr/share/doc/infeditor/", "644"],
+    ["LICENSE", "usr/share/doc/infeditor/copyright", "644"],
+    ["packaging/linux/infeditor.desktop", "usr/share/applications/infeditor.desktop", "644"],
+    ["packaging/linux/infeditor.png", "usr/share/icons/hicolor/64x64/apps/infeditor.png", "644"],
+    ["packaging/icon/png/infeditor-16.png", "usr/share/icons/hicolor/16x16/apps/infeditor.png", "644"],
+    ["packaging/icon/png/infeditor-24.png", "usr/share/icons/hicolor/24x24/apps/infeditor.png", "644"],
+    ["packaging/icon/png/infeditor-32.png", "usr/share/icons/hicolor/32x32/apps/infeditor.png", "644"],
+    ["packaging/icon/png/infeditor-48.png", "usr/share/icons/hicolor/48x48/apps/infeditor.png", "644"],
+    ["packaging/icon/png/infeditor-128.png", "usr/share/icons/hicolor/128x128/apps/infeditor.png", "644"],
+    ["packaging/icon/png/infeditor-256.png", "usr/share/icons/hicolor/256x256/apps/infeditor.png", "644"],
+]

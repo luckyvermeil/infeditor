@@ -1,0 +1,45 @@
+[package]
+name = "blitz-net"
+description = "Blitz networking"
+documentation = "https://docs.rs/blitz-net"
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+http2 = ["reqwest/http2"]
+cookies = ["reqwest/cookies"]
+multipart = ["reqwest/multipart", "reqwest/stream"]
+cache = ["dep:reqwest-middleware", "dep:http-cache-reqwest", "dep:directories", "dep:http-cache"]
+tracing = ["dep:tracing"]
+
+[dependencies]
+# Blitz dependencies
+blitz-traits = { workspace = true }
+
+# Networking dependencies
+tokio = { workspace = true, features = ["sync", "time"] }
+# 本仓库本地补丁：`native-tls` → `rustls-tls`。native-tls 在 Linux 上落在
+# openssl-sys（交叉编译必须带 sysroot/pkg-config），rustls 是纯 Rust、零系统
+# 依赖。宿主应用从不使用 blitz-net 的 client（自建 NetProvider 走 ureq+rustls，
+# 见 infeditor `ui::mdnet`），此依赖只为让 dioxus-native 编译通过。
+reqwest = { workspace = true, features = ["charset", "rustls", "form"] }
+data-url = { workspace = true }
+
+# Caching
+reqwest-middleware = { workspace = true, optional = true, features = ["form"]}
+http-cache-reqwest = { workspace = true, optional = true, features = ["manager-cacache"] }
+http-cache = { workspace = true, optional = true, features = ["url-standard"] }
+directories = { workspace = true, optional = true }
+
+tracing = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+reqwest = { workspace = true, features = ["native-tls-vendored"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = { workspace = true }

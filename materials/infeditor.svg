@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- InfEditor application mark: a white page lifting off an accent tile,
+       a short line ending in a caret (the editing cue).
+       This is the >= 32px version (soft drop shadow); 16/20/24px come from
+       infeditor-small.svg, which drops the shadow and grows the page so the
+       mark survives pixel-hinting at tiny sizes. -->
+  <defs>
+    <linearGradient id="tile" x1="0.05" y1="0" x2="0.95" y2="1">
+      <stop offset="0" stop-color="#6f97ff"/>
+      <stop offset="0.52" stop-color="#4477f7"/>
+      <stop offset="1" stop-color="#2743b8"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="lift" x="-30%" y="-20%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#0b1740" flood-opacity="0.32"/>
+    </filter>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#tile)"/>
+  <rect width="256" height="256" rx="56" fill="url(#sheen)"/>
+  <path filter="url(#lift)"
+        d="M68 24 H160 L208 72 V204 A20 20 0 0 1 188 224 H68 A20 20 0 0 1 48 204 V44 A20 20 0 0 1 68 24 Z"
+        fill="#ffffff"/>
+  <path d="M160 24 L208 72 H174 A14 14 0 0 1 160 58 Z" fill="#bdd0ff"/>
+  <g fill="#3c62dc">
+    <rect x="74" y="98" width="108" height="16" rx="8"/>
+    <rect x="74" y="140" width="62" height="16" rx="8"/>
+    <rect x="74" y="192" width="86" height="14" rx="7" opacity="0.42"/>
+    <rect x="152" y="128" width="22" height="46" rx="11"/>
+  </g>
+</svg>

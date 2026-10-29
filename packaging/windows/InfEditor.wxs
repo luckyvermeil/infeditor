@@ -1,0 +1,465 @@
+<!--
+  InfEditor Windows MSI (WiX v4+ schema; built with the `wix` dotnet tool, v5+).
+
+  Build (see build-msi.ps1, run from anywhere; the script fixes the working dir):
+    wix build -arch x64 -ext WixToolset.UI.wixext \
+      -d ProductVersion=0.1.0 -d BinDir=target/release \
+      -out dist/InfEditor-0.1.0-x64.msi InfEditor.wxs
+
+  - **Wizard pages.** `WixUI_InstallDir` (not `WixUI_FeatureTree`): the
+    install **path** gets its own step with a visible "Browse…" button
+    instead of the Browse button tucked into a feature tree. The
+    **file-association opt-in** is likewise a step of its own
+    (`AssocDlg`, inserted between the directory page and the ready page)
+    rather than a checkbox buried in the feature tree — one question per
+    page, and the two decisions the user actually cares about are both
+    plain to see.
+  - **File associations are a separate, optional feature.** The editor ships
+    its own association flow (ui::assoc + platform::assoc) with per-group
+    registration, take-default with archive/restore, and a live preview; an
+    MSI-level duplicate would fight it. What the installer offers instead is
+    an **optional "Common file associations" feature** (on by default,
+    switched off by unchecking the box on `AssocDlg`, which publishes
+    `Remove=FileAssociations`) that writes the **same HKCU keys** the
+    editor's own flow writes — ProgID `InfEditor_file`,
+    `Applications\infeditor.exe`, the Default-apps capability manifest, and
+    `OpenWithProgids` for a fixed list of common extensions. It deliberately
+    does NOT take the default handler: Windows 10+ keeps the effective
+    default in a per-user `UserChoice` hash an installer cannot set, so the
+    honest setup-time action is "add to Open with"; per-group take-over
+    (with PrevDefault archive/restore) stays in Preferences. The keys are
+    per-user (HKCU), so on a per-machine install only the installing user
+    gets them; other users can register from Preferences. Uninstall removes
+    exactly what the feature wrote. A silent install
+    (`msiexec /i … /qn`) skips every dialog and therefore installs the
+    feature, matching the previous default-on behaviour.
+    Upgrade / uninstall of this MSI therefore leaves the editor's own
+    per-group state (PrevDefault etc.) alone. The page is also reachable
+    **after** installation: Apps & features → Change opens it again, with the
+    checkbox seeded from the feature's current state (see the SetProperty row
+    below) — otherwise a skipped opt-in could only be fixed by reinstalling.
+    Note the one asymmetry with the NSIS installer: if the user later takes
+    over a default handler in Preferences, uninstall cannot restore it from
+    here (the MSI engine has no archive lookup at uninstall time), while
+    InfEditor.nsi does via AssocUnwrite. README asks users to hand the
+    default back before uninstalling.
+  - The binary links the dynamic MSVC CRT. UCRT ships with Windows 10+;
+    `vcruntime140.dll` may need the VC++ redistributable on stripped-down
+    machines (one-time install; mentioned in the release notes). Switching the
+    build to `+crt-static` would remove even that, at the cost of a bigger exe.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="InfEditor"
+           Manufacturer="InfEditor Developers"
+           Version="$(ProductVersion)"
+           Scope="perMachine"
+           UpgradeCode="6949c241-283e-43ac-a9eb-43a9a739c3a9"
+           Compressed="yes"
+           Language="1033">
+
+    <SummaryInformation Description="InfEditor — a WYSIWYG Markdown / text editor" />
+
+    <!-- In-place major upgrade: uninstall the old product first. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Add/Remove Programs icon + start-menu shortcut icon -->
+    <Icon Id="InfEditorIco" SourceFile="$(var.RepoRoot)\packaging\windows\infeditor.ico" />
+    <Property Id="ARPPRODUCTICON" Value="InfEditorIco" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/luckyvermeil/infeditor" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.RepoRoot)\packaging\windows\license.rtf" />
+    <!-- WixUI_InstallDir: Welcome → License → Install folder (Browse…) →
+         File associations (AssocDlg, defined below) → Ready.
+         The directory page is the "change install path" step; the
+         association opt-in is its own page (see the header comment). -->
+    <ui:WixUI Id="WixUI_InstallDir" />
+    <!-- The dialog below publishes SetTargetPath against this property; the
+         value is the directory id the payload actually installs into. -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <!-- AssocDlg's checkbox. Public (uppercase) so its state survives dialog
+         transitions; default 1 = checked. The dialog's Next button turns it
+         into AddLocal / Remove for the FileAssociations feature. -->
+    <Property Id="INSTALLASSOC" Value="1" />
+
+    <!-- Maintenance mode must *seed* that checkbox from what is actually on
+         disk, not from the Property default. Two reasons: a user who unticked
+         the box last time would otherwise see it ticked again on "Change" and
+         get the associations silently re-added on the next Next; and a user
+         who is opening Change *because* they want to add them needs the box to
+         already reflect "not installed". `&Feature = 3` is the post-costing
+         action state (3 = local, 2 = absent) and only exists after
+         CostFinalize, so the row has to sit behind it.
+         One row, not two: the Property default already covers "present"
+         (checked), so only the absent case needs overriding — and a second
+         SetProperty on the same property would collide on the generated
+         `SetINSTALLASSOC` custom-action id. `Installed` keeps the row out of a
+         first-time install, so the Property default and `msiexec
+         INSTALLASSOC=0` still behave exactly as before. -->
+    <SetProperty Id="INSTALLASSOC" Value="0" After="CostFinalize"
+                 Condition="Installed AND (&amp;FileAssociations&lt;&gt;3)" />
+
+    <!-- Desktop shortcut on by default; `msiexec INSTALLDESKTOPSHORTCUT=""` opts out -->
+    <Property Id="INSTALLDESKTOPSHORTCUT" Value="1" />
+
+    <!-- ==================== The file-association step ======================
+         A page of its own, between the install-folder page and the ready
+         page. Unchecking the box publishes Remove=FileAssociations, which
+         the CostFinalize after the UI sequence turns into "feature absent";
+         leaving it checked publishes AddLocal for the same feature (a no-op
+         when it is already going to be installed, which keeps the two
+         branches symmetric and makes Back/Next idempotent).
+
+         Navigation: `WixUI_InstallDir`'s built-in InstallDirDlg→VerifyReadyDlg
+         ControlEvent is Order 4, so the insertion below must use a **higher**
+         Order (5). Both fire; the later NewDialog is the one MSI shows. -->
+    <UI>
+      <Dialog Id="AssocDlg" Width="370" Height="270" Title="[ProductName] Setup" NoMinimize="yes">
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15"
+                 Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}File associations" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15"
+                 Transparent="yes" NoPrefix="yes"
+                 Text="Choose how [ProductName] registers itself for common document types." />
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44"
+                 TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="AssocCheck" Type="CheckBox" X="25" Y="64" Width="320" Height="26"
+                 Property="INSTALLASSOC" CheckBoxValue="1"
+                 Text="Add InfEditor to the Open with menu for common document types" />
+        <Control Id="AssocList" Type="Text" X="42" Y="90" Width="300" Height="60"
+                 NoPrefix="yes"
+                 Text=".txt  .md  .markdown  .log  .csv  .tsv  .json  .jsonl  .ndjson  .xml  .yml  .yaml  .toml  .ini" />
+        <Control Id="AssocNote" Type="Text" X="25" Y="158" Width="320" Height="70"
+                 NoPrefix="yes"
+                 Text="Only the Open with menu entry is added — no default handler is taken over. Per-type defaults can be changed later in the editor under Preferences, File Types." />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="Back" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17"
+                 Default="yes" Text="Next" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17"
+                 Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" Condition="1" />
+        </Control>
+      </Dialog>
+
+      <!-- No condition on purpose. The obvious gate is
+           `WIXUI_INSTALLDIR_VALID="1"`, but that property is produced by the
+           engine at runtime (CheckTargetPath) and appears nowhere in this
+           package — no Property row, no CustomAction row. When it does not
+           materialise the page is skipped **silently**: the extension's own
+           InstallDirDlg→VerifyReadyDlg row is unconditional (Condition="1"),
+           so the wizard still advances and the user never learns a step was
+           dropped. That is the shape of the "the installer never asked me about
+           associations" report. Order 5 (the extension's row is 4) is what puts
+           this page between the folder page and the ready page; nothing else
+           needs to be true. An invalid folder never gets this far — Next pops
+           CheckTargetPath's own error at Order 1 and stays put. -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="AssocDlg"
+               Order="5" />
+      <!-- Back has two destinations depending on how the page was reached:
+           from the install-folder page, or from the maintenance page. -->
+      <Publish Dialog="AssocDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="1"
+               Condition="NOT Installed" />
+      <Publish Dialog="AssocDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="1"
+               Condition="Installed" />
+      <Publish Dialog="AssocDlg" Control="Next" Event="AddLocal" Value="FileAssociations" Order="1"
+               Condition='INSTALLASSOC="1"' />
+      <Publish Dialog="AssocDlg" Control="Next" Event="Remove" Value="FileAssociations" Order="2"
+               Condition='INSTALLASSOC&lt;&gt;"1"' />
+      <Publish Dialog="AssocDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="3" />
+
+      <!-- The second way in, and the one that used to be missing entirely.
+           `WixUI_InstallDir`'s Change button publishes only
+           `WixUI_InstallMode=Change` and then navigates **nowhere** (there is
+           no feature tree to customize, so the extension leaves the button
+           inert — the row is in the ControlEvent table with no NewDialog).
+           Consequence before this row: once the product was installed, the
+           association page could never be reached again — re-running the same
+           MSI goes straight to MaintenanceWelcomeDlg, and Change did nothing.
+           Order 2 so the InstallMode row above it (Order 1) still runs first;
+           the checkbox is seeded from the real feature state by the
+           SetProperty row near INSTALLASSOC. -->
+      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="AssocDlg"
+               Order="2" />
+    </UI>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="InfEditor">
+        <Component Id="MainExe">
+          <File Id="InfEditorExe" Name="infeditor.exe" Source="$(var.BinDir)\infeditor.exe" KeyPath="yes" />
+        </Component>
+        <!-- One file per component: WiX v4 auto-generates component GUIDs only
+             for single-file components (KeyPath). -->
+        <Component Id="ReadmeEn">
+          <File Id="ReadmeEnFile" Name="README.md" Source="$(var.RepoRoot)\README.md" KeyPath="yes" />
+        </Component>
+        <Component Id="ReadmeZh">
+          <File Id="ReadmeZhFile" Name="README.zh-CN.md" Source="$(var.RepoRoot)\README.zh-CN.md" KeyPath="yes" />
+        </Component>
+        <Component Id="LicenseTxt">
+          <File Id="LicenseFile" Name="LICENSE" Source="$(var.RepoRoot)\LICENSE" KeyPath="yes" />
+        </Component>
+
+        <!-- ==================== Optional file associations ====================
+             The exact HKCU footprint of the editor's own registration flow
+             (platform::assoc + ui::assoc): ProgID `InfEditor_file`,
+             `Applications\infeditor.exe` + Capabilities, and one
+             `OpenWithProgids` entry per extension. Registry-only components
+             carry an explicit Guid. `OpenWithProgids` is written as an empty
+             REG_SZ: the editor writes REG_NONE, but the shell and the editor
+             both test *existence*, never the type. -->
+        <Component Id="AssocProgId" Guid="B8B579B3-AE31-440C-9361-4A51DE409D57">
+          <RegistryKey Root="HKCU" Key="Software\Classes\InfEditor_file\shell\open\command">
+            <!-- [#InfEditorExe] = the installed exe's full path -->
+            <RegistryValue Type="string" Value='&quot;[#InfEditorExe]&quot; &quot;%1&quot;' KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\InfEditor_file">
+            <RegistryValue Name="FriendlyTypeName" Type="string" Value="InfEditor Document" />
+            <RegistryValue Name="DefaultIcon" Type="string" Value='&quot;[#InfEditorExe]&quot;,0' />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocAppEntry" Guid="07C97A86-A1F0-444E-AB71-662F77941286">
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\shell\open\command">
+            <RegistryValue Type="string" Value='&quot;[#InfEditorExe]&quot; &quot;%1&quot;' KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe">
+            <RegistryValue Name="FriendlyAppName" Type="string" Value="InfEditor" />
+            <RegistryValue Name="DefaultIcon" Type="string" Value='&quot;[#InfEditorExe]&quot;,0' />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities">
+            <RegistryValue Name="ApplicationName" Type="string" Value="InfEditor" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor">
+            <RegistryValue Name="Capabilities" Type="string" Value="Software\InfEditor\Capabilities" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities">
+            <RegistryValue Name="ApplicationName" Type="string" Value="InfEditor" />
+            <RegistryValue Name="ApplicationDescription" Type="string" Value="WYSIWYG Markdown / text editor" />
+          </RegistryKey>
+        </Component>
+        <!-- One component per extension, in the order of the list above.
+             Adding an extension: append a component here and a ComponentRef
+             in the FileAssociations feature below, with a freshly generated
+             GUID (new extensions must never reuse a component GUID). -->
+        <Component Id="AssocTxt" Guid="16541CB2-C4E4-4889-96D7-40255D622746">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.txt\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".txt" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".txt" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocMd" Guid="254E1FA4-5AE2-42E5-BC10-7A32E80B6744">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.md\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".md" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".md" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocMarkdown" Guid="4AD5B1A1-685F-4359-810A-DE674EB16A33">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.markdown\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".markdown" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".markdown" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocLog" Guid="10A21FE7-9BFF-4CA9-80FB-D6A17B7F7806">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.log\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".log" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".log" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocCsv" Guid="1F7D67AF-0DEB-4E2B-BC68-3083F3C3C368">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.csv\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".csv" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".csv" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocTsv" Guid="CD0B9AC8-D098-4863-8C1D-E00ED7497669">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.tsv\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".tsv" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".tsv" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocJson" Guid="CFA12A98-5D21-43B0-85C6-D6A70025BAF7">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.json\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".json" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".json" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocJsonl" Guid="099EA742-FDD6-4CA0-98DE-CE9256154D1F">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.jsonl\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".jsonl" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".jsonl" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocNdjson" Guid="13D226E5-A5BA-45F3-BAAD-24CBD1E93F78">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.ndjson\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".ndjson" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".ndjson" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocXml" Guid="E9E420B2-3825-4A40-B6D3-21F310FF8FB4">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.xml\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".xml" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".xml" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocYml" Guid="F7267BF5-FE48-499D-832C-1474BBECEB7D">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.yml\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".yml" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".yml" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocYaml" Guid="EC043E61-6615-47E9-9154-2995971E0C28">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.yaml\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".yaml" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".yaml" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocToml" Guid="1644E315-87CC-4E84-B0E4-8D8DF161E466">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.toml\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".toml" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".toml" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+        <Component Id="AssocIni" Guid="00BEE92D-8EEC-4B51-8DA9-CF619F36884A">
+          <RegistryKey Root="HKCU" Key="Software\Classes\.ini\OpenWithProgids">
+            <RegistryValue Name="InfEditor_file" Type="string" Value="" KeyPath="yes" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\InfEditor\Capabilities\FileAssociations">
+            <RegistryValue Name=".ini" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+          <RegistryKey Root="HKCU" Key="Software\Classes\Applications\infeditor.exe\Capabilities\FileAssociations">
+            <RegistryValue Name=".ini" Type="string" Value="InfEditor_file" />
+          </RegistryKey>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="InfEditor">
+        <Component Id="StartMenuShortcut">
+          <Shortcut Id="StartMenuInfEditor"
+                    Name="InfEditor"
+                    Description="WYSIWYG Markdown / text editor"
+                    Target="[INSTALLFOLDER]infeditor.exe"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="InfEditorIco" />
+          <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\InfEditor\Installer"
+                         Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Condition="INSTALLDESKTOPSHORTCUT">
+        <Shortcut Id="DesktopInfEditor"
+                  Name="InfEditor"
+                  Description="WYSIWYG Markdown / text editor"
+                  Target="[INSTALLFOLDER]infeditor.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="InfEditorIco" />
+        <RegistryValue Root="HKCU" Key="Software\InfEditor\Installer"
+                       Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="InfEditor" Level="1" AllowAbsent="no"
+             Description="The InfEditor editor, start menu and desktop shortcuts.">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="ReadmeEn" />
+      <ComponentRef Id="ReadmeZh" />
+      <ComponentRef Id="LicenseTxt" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+    <!-- Level 1 = installed unless switched off. With WixUI_InstallDir there
+         is no feature tree; the opt-out lives on AssocDlg (it publishes
+         `Remove=FileAssociations`, see the UI block above). Uninstall removes
+         every key the feature wrote, in both cases. -->
+    <Feature Id="FileAssociations" Title="Common file associations" Level="1"
+             AllowAbsent="yes"
+             Description="Adds InfEditor to the Open with menu for common document types (.txt .md .log .csv .json ...), per user. Full per-group control stays in Preferences, File Types.">
+      <ComponentRef Id="AssocProgId" />
+      <ComponentRef Id="AssocAppEntry" />
+      <ComponentRef Id="AssocTxt" />
+      <ComponentRef Id="AssocMd" />
+      <ComponentRef Id="AssocMarkdown" />
+      <ComponentRef Id="AssocLog" />
+      <ComponentRef Id="AssocCsv" />
+      <ComponentRef Id="AssocTsv" />
+      <ComponentRef Id="AssocJson" />
+      <ComponentRef Id="AssocJsonl" />
+      <ComponentRef Id="AssocNdjson" />
+      <ComponentRef Id="AssocXml" />
+      <ComponentRef Id="AssocYml" />
+      <ComponentRef Id="AssocYaml" />
+      <ComponentRef Id="AssocToml" />
+      <ComponentRef Id="AssocIni" />
+    </Feature>
+  </Package>
+</Wix>
