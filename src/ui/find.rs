@@ -830,6 +830,7 @@ impl EditorState {
             progress,
             total,
             cancel,
+            cancel_requested: false,
             kind,
             started: std::time::Instant::now(),
             doc_id: self.tab().doc.id,
@@ -911,6 +912,11 @@ impl EditorState {
                 self.handle_search_outcome(job, outcome);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // The user already asked to stop: leave "cancelling…" on the status
+                // bar instead of repainting a percentage the worker is abandoning.
+                if job.cancel_requested {
+                    return;
+                }
                 let done = job.progress.load(Ordering::Relaxed);
                 let pct = done
                     .checked_mul(100)
@@ -957,7 +963,7 @@ impl EditorState {
                 cancelled,
                 gen,
             } => {
-                if cancelled {
+                if cancelled || job.cancel_requested {
                     self.status = Some(Msg::StatusFindAllCancelled.into());
                     return;
                 }
@@ -971,7 +977,7 @@ impl EditorState {
                 cancelled,
                 ..
             } => {
-                if cancelled || job.cancel.load(Ordering::Relaxed) {
+                if cancelled || job.cancel_requested {
                     self.status = Some(Msg::StatusReplaceAllCancelled.into());
                     return;
                 }
@@ -1014,7 +1020,7 @@ impl EditorState {
                 cancelled,
                 gen: _,
             } => {
-                if cancelled {
+                if cancelled || job.cancel_requested {
                     // Cancellation is cooperative: batches already applied are
                     // rolled back as one undo step when the document still
                     // matches the state our last batch produced.
@@ -1065,9 +1071,15 @@ impl EditorState {
     /// Cancellation is **cooperative**: once the flag is set, the worker exits at the next
     /// window boundary and the already-scanned part is discarded. A replace job writes not a
     /// single byte when cancelled.
+    ///
+    /// Because it is cooperative, the worker may have already finished by the time the flag is
+    /// visible to it — a limit-truncated scan returns straight from the loop without re-reading
+    /// the flag. The intent is therefore also recorded on the job ([`SearchJob::cancel_requested`]),
+    /// so an outcome that crosses the request is still discarded instead of filling the panel.
     pub fn cancel_search(&mut self) -> bool {
-        match &self.search_job {
+        match &mut self.search_job {
             Some(job) => {
+                job.cancel_requested = true;
                 job.cancel.store(true, Ordering::Relaxed);
                 self.status = Some(Msg::StatusCancellingSearch.into());
                 true

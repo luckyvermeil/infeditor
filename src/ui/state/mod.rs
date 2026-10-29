@@ -846,6 +846,16 @@ pub struct SearchJob {
     pub progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub total: u64,
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The user pressed Esc while this job was running.
+    ///
+    /// `cancel` is the worker's cooperative flag: it is only looked at on a
+    /// window boundary, and never again once the scan has produced its final
+    /// outcome (a limit-truncated scan returns straight from the loop). So a
+    /// job that finishes in the same instant the user cancels would report
+    /// `cancelled: false` and write its results anyway. The UI records the
+    /// intent here instead: any outcome arriving after this point is
+    /// discarded, whichever side of the race the worker landed on.
+    pub cancel_requested: bool,
     pub kind: SearchJobKind,
     pub started: std::time::Instant,
     /// Document identity when the scan started. The user may switch tabs
