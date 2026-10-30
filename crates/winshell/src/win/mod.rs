@@ -12,7 +12,6 @@
 //!   and answer `WM_NCHITTEST`;
 //! * [`softkb`] — touch keyboard (TabTip) detection (throttled).
 
-pub mod cloak;
 pub mod frameless;
 pub mod snap;
 pub mod softkb;

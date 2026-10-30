@@ -378,3 +378,61 @@ DOM 增删，正好把窗口期踩实。
 保留（修复前已塌缩），菜单「复制」后剪贴板 = 选中文本。
 
 上游修复后摘除。
+
+## 补丁十七：packages/blitz-shell/src/{window.rs, prepaint.rs}（首帧之前先把窗口刷成底色）
+
+**现场**：不管是暗色还是亮色主题，应用窗口一出现先是**纯白**（暗色下尤其刺眼），
+直到渲染器首帧呈现才变成真正的界面。窗口被 `View::init` 在创建后立刻
+`set_visible(true)`，而这一刻**没有任何像素属于它**：渲染器的 surface 还没建
+（在 `resume`/`complete_resume` 里），winit 也从不擦背景——它的 `WM_PAINT` 先
+`ValidateRect` 再 `DefWindowProc`，窗口类注册时 `hbrBackground` 又是 `NULL`。
+于是合成器只能合成一块没画过的表面，Windows 上就是白色。
+
+两条"绕过"都不合适：DWM cloak 等到首帧会**把窗口藏住**（冷启动整段不可见，
+用户明确要求去掉）；改成"首帧呈现后再 show"则要等渲染器初始化（建 device、
+编 shader，实测 debug 版 ~0.6s），窗口出现明显变慢。
+
+**修法**：让 blitz 在把窗口交给合成器之前就把它刷成应用底色。
+
+1. `WindowConfig` 增加 `background: Option<[u8; 3]>` 与链式
+   `with_background(rgb)`（不引入任何新依赖；`None` 时行为与上游完全一致）；
+2. 新增 `prepaint` 模块（Windows 实现，其它平台空实现），在 `View::init`
+   里按固定顺序调用：
+   * `prepare()` —— **show 之前**把颜色装成窗口**类背景刷**
+     （`SetClassLongPtrW(GCLP_HBRBACKGROUND)`）：show 会让整个客户区失效，系统
+     紧接着就要背景，只有类背景刷能吃到这一次擦除；
+   * `suppress_show_transition()` —— `DWMWA_TRANSITIONS_FORCEDISABLED`：Windows
+     给新窗口做 ~100ms 淡入（按部分不透明度合成），否则底色对了也会透出桌面；
+   * `show()` —— `DWMWA_CLOAK` 短暂遮一下 → `set_visible(true)` → **show 之后**
+     `GetDC`+`FillRect` 填客户区 → 撤掉 cloak。遮罩只覆盖"显示↔填充"这几微秒，
+     防止合成器恰好在这一瞬取到未绘制的表面（只填不遮会偶发一帧白，实测能抓到）；
+     不等待任何帧，窗口仍然是"一启动就出现"。
+
+**应用层配套**：`winshell::shell::launch` 把渲染器的 `base_color`（主题背景色）
+同时通过 `with_background` 传给 blitz（弹窗同样传，见 `open_child`），并显式
+`alpha_mode: CompositeAlphaMode::Opaque`——默认 `Auto` 在 Windows 上会被挑成
+预乘 alpha，DWM 按逐像素合成，任何"没画过"的帧（首帧、swapchain 重建）都会让
+窗口整块透明。
+
+**验证**：`tmp/startup_probe.py`（品红窗口垫底 + `GetPixel` 高频采样）修复前
+能抓到一整帧纯白；修复后 2.3s 内采样序列只有"品红外（窗口未出现）→ 主题底色"，
+暗/亮两种主题都无白帧、无透明帧、无淡入；主窗口出现时间仍是 ~0.3s（与修复前一致）。
+`tests_py/test_smoke / test_window / test_recovery / test_view` 11 passed。
+
+上游修复后摘除。
+
+### 补丁十七（续）：关闭时同样"绘制"而不是"隐藏"
+
+`View::drop` 先 `renderer.suspend()`（"GPU surface 不能比窗口活得久"），才轮到窗口和文档
+析构，所以这段空档 DWM 合成的是 HWND 上残留的内容——以前用 DWM cloak 把所有窗口藏起来
+盖掉，但那是"窗口先消失、进程后退出"，和启动时被要求去掉的"藏窗口"是同一类行为。
+
+现在关闭路径与启动对称：`View` 记住 `WindowConfig::with_background` 的颜色，提供
+`paint_background()`；`ShellApp::drop` 在析构前对每个窗口调用一次，把客户区刷成同一主题底色。
+cloak 相关代码（`win/cloak.rs`、`win32::cloak_all_windows`）随之整体删除。
+
+实测（品红窗口垫底 + `GetPixel` 高频采样，并在 `View::drop` 里临时挂起 1.5s 放大窗口）：
+Windows/DX12 flip-model 下最后一帧在 surface 释放后仍被合成，采样只看到主题底色
+（`18,19,20`），没有白帧；同一实验里用 GDI 往"已挂 swapchain 的窗口"画红色也不会显示——
+说明这里的 `paint_background()` 是**保险**而非关键路径（真正兜住的是 flip-model 保留的最后一帧），
+保留它与启动侧同一套语义，代价只有一次 `FillRect`。

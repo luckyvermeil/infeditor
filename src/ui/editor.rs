@@ -123,12 +123,12 @@ html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; }
 
 #[component]
 pub fn EditorApp() -> Element {
-    // First frame = skeleton state (only peeks at the theme flag from
+    // First frame = boot placeholder (only peeks at the theme flag from
     // settings, one small IO): the window becomes visible before any content
     // exists; full loading (settings/font metrics/recovery scan/command-line
-    // file) is deferred until after the skeleton's first frame (see the boot
-    // sequence in the RedrawRequested branch), so dark-theme users no longer
-    // see a white first screen.
+    // file) is deferred until after that first — flat, theme-colored — frame
+    // (see the boot sequence in the RedrawRequested branch), so dark-theme
+    // users never see a white first screen.
     let mut state = use_signal(EditorState::skeleton);
     use_context_provider(move || state);
     // Scrollbar drag's input-side thumb: a **dedicated** signal so a pointer
@@ -201,10 +201,10 @@ pub fn EditorApp() -> Element {
     }
     window_events(state, window.clone(), sb_live, hwnd);
 
-    // Boot skeleton screen: until the real state finishes booting, draw only
-    // the theme-correct skeleton (boot sequence in the RedrawRequested
-    // branch). Placed after all use_* hooks — dioxus requires a constant hook
-    // order, so conditional rendering can only happen after hook registration.
+    // Boot first screen: until the real state finishes booting, draw only a
+    // flat theme-colored canvas (boot sequence in the RedrawRequested branch).
+    // Placed after all use_* hooks — dioxus requires a constant hook order, so
+    // conditional rendering can only happen after hook registration.
     if !state.read().booted {
         return skeleton_screen(state.read().theme());
     }
@@ -801,20 +801,19 @@ fn window_events(
             }
         }
         WindowEvent::RedrawRequested => {
-            // Boot sequence (skeleton timing): after the skeleton's first
-            // frame is drawn, the next redraw synchronously builds the
-            // real state (all the heavy lifting in `EditorState::default`:
-            // settings/font metrics/recovery scan/command-line file) and
-            // swaps it in wholesale — while boot blocks, the screen still
-            // shows the skeleton, so the user sees neither a white screen
-            // nor a gap.
+            // Boot sequence: after the first (flat background) frame is drawn,
+            // the next redraw synchronously builds the real state (all the
+            // heavy lifting in `EditorState::default`: settings/font
+            // metrics/recovery scan/command-line file) and swaps it in
+            // wholesale — while boot blocks, the screen still shows that
+            // background, so the user sees neither a white screen nor a gap.
             if !state.read().booted {
                 static SKELETON_FRAMES: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 let n = SKELETON_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n == 0 {
-                    // Skeleton first frame: schedule one more frame; boot
-                    // runs during that frame's event phase
+                    // First frame: schedule one more frame; boot runs during
+                    // that frame's event phase
                     window.request_redraw();
                 } else {
                     boot_editor_state(&mut state, &window);
@@ -1055,31 +1054,27 @@ fn boot_editor_state(state: &mut Signal<EditorState>, window: &Arc<dyn Window>) 
     *state.write() = full;
 }
 
-/// Boot skeleton screen (`EditorState::booted == false`): a theme-correct
-/// first-screen placeholder.
+/// Boot first screen (`EditorState::booted == false`): the theme's background
+/// color as one flat fill.
 ///
-/// Draws only solid blocks (title bar / sidebar / body lines / status bar),
-/// with no text or controls — the skeleton frame's goal is to hit the screen
-/// fast at near-zero layout cost; the real UI replaces it wholesale in the
-/// boot frame.
+/// This used to be a "skeleton": fake chrome (title bar / sidebar / a few text
+/// lines / status bar) drawn to make the placeholder look like an editor. Boot
+/// takes one or two frames, so the user saw those shapes appear and then vanish
+/// again when the real UI replaced them — a flicker that never matched the
+/// final layout anyway.
+///
+/// A single solid fill has the same job (nothing white, nothing empty) and no
+/// transition to notice: it is exactly the color blitz already painted into the
+/// window before the first frame (`WindowConfig::with_background`, InfEditor
+/// patch 17), so the real UI simply appears where the background was.
+///
+/// Cost is the point: this frame has nothing else to show and must reach the
+/// screen fast, so it stays one div with no content and no layout work.
 fn skeleton_screen(t: &'static Theme) -> Element {
     rsx! {
         div {
-            style: "position:absolute; inset:0; background:{t.bg}; overflow:hidden;
-                    font-family:{FONT_UI}; user-select:none;",
+            style: "position:absolute; inset:0; background:{t.bg}; overflow:hidden;",
             style { "{GLOBAL_CSS}" }
-            div { style: "position:absolute; top:0; left:0; right:0; height:36px;
-                    background:{t.menu_bg}; border-bottom:1px solid {t.menu_border};" }
-            div { style: "position:absolute; top:37px; left:0; width:220px; bottom:25px;
-                    background:{t.gutter_bg};" }
-            div { style: "position:absolute; top:64px; left:248px; width:52%; height:10px;
-                    border-radius:4px; background:{t.gutter_bg};" }
-            div { style: "position:absolute; top:88px; left:248px; width:68%; height:10px;
-                    border-radius:4px; background:{t.gutter_bg};" }
-            div { style: "position:absolute; top:112px; left:248px; width:44%; height:10px;
-                    border-radius:4px; background:{t.gutter_bg};" }
-            div { style: "position:absolute; bottom:0; left:0; right:0; height:24px;
-                    background:{t.menu_bg}; border-top:1px solid {t.menu_border};" }
         }
     }
 }

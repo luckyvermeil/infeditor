@@ -181,6 +181,13 @@ pub struct Snap {
     /// Find history (most recent first, ≤30)
     pub history: Vec<String>,
     pub dark: bool,
+    /// Caret blink phase (`bridge::blink_on()`) at flush time.
+    ///
+    /// The dialog's input is a real `<input>`: its caret is painted by blitz,
+    /// which keeps no blink timer of its own. The phase therefore has to reach
+    /// the popup as data — each flip changes the snapshot, which re-pushes it
+    /// and repaints the caret (`caret-color` follows this flag).
+    pub blink: bool,
     pub theme: &'static Theme,
 }
 
@@ -203,6 +210,7 @@ impl Default for Snap {
             in_sel: false,
             history: Vec::new(),
             dark: false,
+            blink: true,
             theme: Theme::of(false),
         }
     }
@@ -227,6 +235,7 @@ impl PartialEq for Snap {
             && self.in_sel == other.in_sel
             && self.history == other.history
             && self.dark == other.dark
+            && self.blink == other.blink
     }
 }
 
@@ -264,6 +273,7 @@ pub fn sync_shared(st: &EditorState) {
             in_sel: st.find.in_sel,
             history: st.find.history.clone(),
             dark: st.dark,
+            blink: winshell::shell::bridge::blink_on(),
             theme: st.theme(),
         });
     });
@@ -277,7 +287,13 @@ pub fn sync_shared(st: &EditorState) {
 /// first flush after registration would be swallowed by dedup and the popup would stay stuck at
 /// [`Snap::default`] (`focus=Doc` → no autofocus on the input → cannot type).
 pub fn flush_snap() {
-    BRIDGE.with(|b| b.flush(|_| {}));
+    // The blink phase is owned by the shell's timer, not by the main window's
+    // state: inject it here so every tick changes the snapshot (and therefore
+    // repaints the caret). Without it the snapshot compare would swallow the
+    // tick and the caret would freeze.
+    BRIDGE.with(|b| {
+        b.flush(|s| s.blink = winshell::shell::bridge::blink_on());
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +495,7 @@ pub fn FindChildWindow() -> Element {
         up,
         wrap,
         in_sel,
+        blink,
         theme,
     ) = {
         let s = snap.read();
@@ -495,6 +512,7 @@ pub fn FindChildWindow() -> Element {
             s.up,
             s.wrap,
             s.in_sel,
+            s.blink,
             s.theme,
         )
     };
@@ -637,6 +655,7 @@ pub fn FindChildWindow() -> Element {
                     value: pattern,
                     placeholder: Msg::FindPhPattern,
                     focused: pattern_focused,
+                    blink,
                     hist: true,
                     hist_open,
                     vh,
@@ -651,6 +670,7 @@ pub fn FindChildWindow() -> Element {
                         value: replacement,
                         placeholder: Msg::FindPhReplace,
                         focused: repl_focused,
+                        blink,
                         hist: false,
                         hist_open,
                         vh,
@@ -773,6 +793,8 @@ fn PopField(
     value: String,
     placeholder: Msg,
     focused: bool,
+    /// Caret blink phase (see `Snap::blink`)
+    blink: bool,
     hist: bool,
     hist_open: Signal<bool>,
     /// Popup content height (the history dropdown clamps its visible rows by it)
@@ -814,7 +836,7 @@ fn PopField(
          font-family:Consolas,'Cascadia Mono',monospace;",
         bg = theme.input_bg,
         fg = theme.menu_fg,
-        caret = theme.caret,
+        caret = if blink { theme.caret } else { "transparent" },
         border = border,
         lh = FIELD_H - 2.0,
     );

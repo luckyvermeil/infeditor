@@ -56,6 +56,14 @@ impl ShellApp {
             DioxusNativeWindowRenderer::default(),
             attrs,
         );
+        // Same pre-first-frame paint as the main window (blitz patch 17): a
+        // popup is shown right after creation too, and without a background it
+        // would be composited unpainted — a white flash over its owner.
+        let cfg = if let Some(bg) = self.bg {
+            cfg.with_background(bg)
+        } else {
+            cfg
+        };
         let mut view = View::init(cfg, el, &self.inner.proxy);
         // The child window only injects the window handle / renderer context
         // (components do not use document/history).
@@ -107,25 +115,6 @@ impl ShellApp {
         // window's next-frame poll_dialogs.
         popup.flush();
     }
-
-    /// Cloak every window the shell still owns — the shutdown half of the
-    /// cold-start cloak. Called once from `ShellApp`'s destructor, before the
-    /// renderer surfaces and the HWNDs are torn down (see the long note
-    /// there).
-    pub(super) fn cloak_all_windows(&self) {
-        // Logged (only with INF_SHELL_LOG) because the result is unobservable
-        // after the fact: a visual "did it flash?" report cannot be reproduced
-        // from a log, but "was the shutdown cloak reached at all" can.
-        if shell_log_on() {
-            slog(&format!(
-                "shutdown: cloaking {} window(s)",
-                self.inner.windows.len()
-            ));
-        }
-        for v in self.inner.windows.values() {
-            cloak(&v.window, true);
-        }
-    }
 }
 
 fn place(window: &std::sync::Arc<dyn winit::window::Window>, x: f32, y: f32, w: f32, h: f32) {
@@ -152,6 +141,49 @@ pub(super) fn place_show(
     // `apply_diff`), re-adding the `WS_EX_APPWINDOW` that the owner attachment
     // cleared (which would put it in the taskbar).
     own_dialog(window, parent, dark);
+    // Last, because `set_visible` also rewrites the extended style.
+    follow_owner_topmost(window, parent);
+}
+
+/// Put the popup into the same topmost band as its owner.
+///
+/// The owner/owned relationship only orders windows **inside** the same band:
+/// a popup owned by a `WS_EX_TOPMOST` main window sits *behind* it and looks
+/// like it never opened (the "always on top" mode is a first-class main-window
+/// feature here — see `Cmd::AlwaysOnTop`). Windows' own dialogs behave the same
+/// way, so the popup follows the owner instead of fighting it.
+///
+/// The owner's band is read per show rather than remembered: the user can
+/// toggle "always on top" while a popup exists.
+fn follow_owner_topmost(window: &std::sync::Arc<dyn winit::window::Window>, parent: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
+    };
+
+    let hwnd = hwnd_of(window);
+    if hwnd == 0 || parent == 0 {
+        return;
+    }
+    let owner_topmost = unsafe { GetWindowLongPtrW(parent as _, GWL_EXSTYLE) as isize }
+        & WS_EX_TOPMOST as isize
+        != 0;
+    let band = if owner_topmost {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd as _,
+            band,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
 }
 
 /// Attach the popup as the main window's owned dialog, and make the system
@@ -167,15 +199,8 @@ fn own_dialog(window: &std::sync::Arc<dyn winit::window::Window>, parent: isize,
     }));
 }
 
-/// DWM-cloak a window: `on` hides it from composition without hiding it from
-/// Win32, so the first frames still paint while the class brush (white) stays
-/// invisible. See [`crate::win::cloak`].
-pub(super) fn cloak(window: &std::sync::Arc<dyn winit::window::Window>, on: bool) {
-    crate::win::cloak::set_cloaked(hwnd_of(window), on);
-}
-
-/// The window's Win32 `HWND` (0 when unavailable). Used only by the Windows
-/// popup path.
+/// The window's Win32 `HWND` (0 when unavailable). Used by the Windows popup
+/// path (owner attach, topmost band, placement).
 fn hwnd_of(window: &std::sync::Arc<dyn winit::window::Window>) -> isize {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match window.window_handle() {

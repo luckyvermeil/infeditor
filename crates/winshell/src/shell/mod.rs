@@ -45,7 +45,9 @@ use dioxus_core::{provide_context, ScopeId};
 use dioxus_native::prelude::*;
 use dioxus_native::use_window;
 use dioxus_native::winit;
-use dioxus_native::{DioxusDocument, DioxusNativeWindowRenderer, DocumentConfig, RendererOptions};
+use dioxus_native::{
+    CompositeAlphaMode, DioxusDocument, DioxusNativeWindowRenderer, DocumentConfig, RendererOptions,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -343,10 +345,12 @@ pub struct ShellApp {
     /// The main window's winit id (recorded at can_create_surfaces; for touch
     /// simulation).
     main_id: Option<WindowId>,
-    /// Deadline for dropping the main window's DWM cloak: `None` = not cloaked /
-    /// already uncloaked. See `can_create_surfaces`.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    cloak_deadline: Option<std::time::Instant>,
+    /// The application's background color, handed to blitz as the pre-first-frame
+    /// paint (`WindowConfig::with_background`, InfEditor patch 17) for every
+    /// window the shell creates — the main window in `launch`, popups here.
+    /// Without it a window is composited before its first frame: the white
+    /// flash this patch exists to prevent.
+    bg: Option<[u8; 3]>,
 }
 
 /// Whether IME is turned off in the test environment (`INFEDITOR_IME=0`).
@@ -443,6 +447,7 @@ impl ShellApp {
         proxy: BlitzShellProxy,
         event_queue: std::sync::mpsc::Receiver<BlitzShellEvent>,
         main_cfg: WindowConfig<DioxusNativeWindowRenderer>,
+        bg: Option<[u8; 3]>,
     ) -> Self {
         let _ = PROXY.set(proxy.clone());
         ShellApp {
@@ -451,7 +456,7 @@ impl ShellApp {
             main_cfg: Some(main_cfg),
             children: Vec::new(),
             main_id: None,
-            cloak_deadline: None,
+            bg,
         }
     }
 
@@ -595,19 +600,13 @@ impl ApplicationHandler for ShellApp {
         // Main window: the same context injection as dioxus_native's launch.
         if let Some(cfg) = self.main_cfg.take() {
             let mut view = View::init(cfg, event_loop, &self.inner.proxy);
-            // Cloak immediately after creation: `View::init` shows the window before
-            // the first frame, so the Win32 class brush (white) is what a dark-theme
-            // cold start shows. DWM cloaking hides it from composition without hiding
-            // it from Win32 — a *hidden* window never receives RedrawRequested
-            // (`RedrawWindow(RDW_INTERNALPAINT)`), so hiding is not an option.
-            // Uncloaked after the first painted frame (or the deadline in
-            // `about_to_wait`).
-            #[cfg(windows)]
-            {
-                win32::cloak(&view.window, true);
-                self.cloak_deadline =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(800));
-            }
+            // Nothing to do about visibility here: blitz shows the window itself
+            // right away, already painted with the background color the app
+            // passed in (`WindowConfig::with_background`, InfEditor patch 17), so
+            // there is no white first screen to cover. The old DWM cloak that
+            // used to hide the window for the whole cold start is gone — startup
+            // paints instead of hiding, and the shutdown path does the same (see
+            // `Drop`).
             timing("window+renderer");
             let winit_window = std::sync::Arc::clone(&view.window);
             // The composer is the only keyboard/IME landing point, always on at
@@ -673,15 +672,6 @@ impl ApplicationHandler for ShellApp {
 
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         timing_once("first_about_to_wait");
-        // Safety net: if the first paint never arrives (lost redraw, driver hiccup),
-        // show the window anyway instead of leaving it cloaked forever.
-        #[cfg(windows)]
-        if self
-            .cloak_deadline
-            .is_some_and(|t| std::time::Instant::now() >= t)
-        {
-            self.uncloak_main();
-        }
         // The window rects queued by the touch follow loop land here in one
         // shot (see `crate::win::frameless::flush_touch_gesture`): the window
         // moves once per event batch instead of once per PointerMoved.
@@ -935,10 +925,6 @@ impl ApplicationHandler for ShellApp {
         }
         if main_redraw {
             timing_once("first_frame_painted");
-            // The frame is presented: drop the cloak (idempotent, Windows-only —
-            // other platforms never cloaked the window in the first place).
-            #[cfg(windows)]
-            self.uncloak_main();
         }
     }
 
@@ -966,50 +952,35 @@ impl ApplicationHandler for ShellApp {
 
 impl Drop for ShellApp {
     fn drop(&mut self) {
-        // Shutdown is the mirror image of the cold-start flash, and needs the
-        // same treatment for the same reason: a window whose GPU surface is gone
-        // but whose HWND is still visible gets the Win32 fallback surface
-        // composed — white.
+        // Shutdown, handled the same way as startup: repaint the windows with
+        // their background color instead of hiding them.
         //
-        // The teardown order is fixed inside blitz (`View::drop` releases the
-        // surface first — "a GPU surface must not outlive the window" — and only
-        // then do the window/document fields drop), so the gap cannot be closed
-        // by reordering. It is not short either: dropping the window's document
-        // (VDOM + DOM tree) takes a visible amount of time, and every frame DWM
-        // composes in that gap shows white.
+        // A window whose GPU surface is gone but whose HWND is still visible
+        // gets the Win32 fallback surface composed — white. The teardown order
+        // is fixed inside blitz (`View::drop` releases the surface first — "a
+        // GPU surface must not outlive the window" — and only then do the
+        // window/document fields drop), so the gap cannot be closed by
+        // reordering; it is not short either (dropping the VDOM + DOM tree takes
+        // a visible amount of time).
         //
-        // Cloaking first hides all of it: the windows leave the composition
-        // (Win32 still sees them, which no longer matters — no frames are wanted
-        // from here on), so the whole teardown happens off-screen. Nothing is
-        // uncloaked: the process is on its way out, and `event_loop.exit()`
-        // offers no callback between the loop ending and this destructor.
+        // Painting the client area with the same color the window started with
+        // (blitz patch 17, `View::paint_background`) makes that window show the
+        // theme background instead of white. The window keeps its size and
+        // position until the process exits, exactly like the startup side, where
+        // the window is painted rather than hidden.
+        //
+        // The old DWM cloak (hide every window during teardown) was removed on
+        // request: it made the window *disappear* before the process was gone,
+        // which is the same "the window goes away" complaint the startup cloak
+        // drew.
         #[cfg(windows)]
-        self.cloak_all_windows();
+        for v in self.inner.windows.values() {
+            v.paint_background();
+        }
     }
 }
 
 impl ShellApp {
-    /// Drop the main window's DWM cloak: called after the first frame, or when the
-    /// deadline expires (never leave the window invisible if the first paint is lost).
-    /// Idempotent.
-    #[cfg(windows)]
-    fn uncloak_main(&mut self) {
-        if self.cloak_deadline.is_none() {
-            return;
-        }
-        // Clear the flag only once the window is actually there: if this runs before
-        // `main_id` is recorded, dropping the flag would leave it cloaked forever.
-        let Some(id) = self.main_id else {
-            return;
-        };
-        let Some(v) = self.inner.windows.get(&id) else {
-            return;
-        };
-        self.cloak_deadline = None;
-        win32::cloak(&v.window, false);
-        v.request_redraw();
-    }
-
     /// Refresh every window's accessibility tree (see the notes in
     /// `about_to_wait`).
     fn refresh_accessibility(&mut self) {
@@ -1860,6 +1831,10 @@ pub fn launch(
     // application layer for a decision (see handle_shell_evt). Injected
     // unconditionally — platform differences stay inside frameless.
     crate::win::frameless::set_close_hook(|| send(ShellEvt::CloseMain));
+    // `0xRRGGBB` form of the same clear color — blitz paints the window with it
+    // before the first frame (see `with_background` below).
+    let rgba = base_color.to_rgba8();
+    let bg = [rgba.r, rgba.g, rgba.b];
     let event_loop: EventLoop = create_default_event_loop();
     let winit_proxy = event_loop.create_proxy();
     let (proxy, event_queue) = BlitzShellProxy::new(winit_proxy);
@@ -1875,11 +1850,26 @@ pub fn launch(
         // flashes a white screen at startup".
         DioxusNativeWindowRenderer::with_options(RendererOptions {
             base_color: Some(base_color),
+            // Opaque compositing. With the default (`Auto`) the renderer picks
+            // a *premultiplied* alpha mode whenever the surface supports it
+            // (it sorts PreMultiplied first), so DWM composites the window
+            // per-pixel: any frame the app has not painted — the first present,
+            // a swapchain reconfiguration — arrives with alpha 0 and the whole
+            // window shows the desktop through it. This UI has no translucent
+            // surfaces, so the surface is declared opaque.
+            alpha_mode: Some(CompositeAlphaMode::Opaque),
             ..RendererOptions::default()
         }),
         attrs,
-    );
-    let application = ShellApp::new(proxy, event_queue, cfg);
+    )
+    // Same color, painted into the client area before the first frame exists
+    // (blitz patch 17, `WindowConfig::with_background`): the window appears
+    // immediately, already in the theme's background color, and the renderer's
+    // first frame (which clears with exactly this color) replaces it without a
+    // visible seam. This is what removes the white first screen — no DWM cloak,
+    // no delayed show.
+    .with_background(bg);
+    let application = ShellApp::new(proxy, event_queue, cfg, Some(bg));
     timing("app");
     // An event-loop error (driver/backend failure) used to `unwrap` — i.e. panic on
     // the way out, which looks exactly like a crash with no message. Log it instead;

@@ -44,6 +44,10 @@ pub struct WindowConfig<Rend: WindowRenderer> {
     doc: Box<dyn Document>,
     pub(crate) attributes: WindowAttributes,
     renderer: Rend,
+    /// InfEditor patch 17: RGB color painted into the client area before the
+    /// first frame exists, so the window is never composited unpainted (the
+    /// white first screen). `None` = upstream behavior. See [`prepaint`].
+    pub(crate) background: Option<[u8; 3]>,
 }
 
 impl<Rend: WindowRenderer> WindowConfig<Rend> {
@@ -60,7 +64,17 @@ impl<Rend: WindowRenderer> WindowConfig<Rend> {
             doc,
             attributes,
             renderer,
+            background: None,
         }
+    }
+
+    /// InfEditor patch 17: set the color the window is painted with before its
+    /// first frame (see [`prepaint`]). Callers normally pass the same color the
+    /// renderer clears each frame with, so the first presented frame blends into
+    /// it seamlessly.
+    pub fn with_background(mut self, rgb: [u8; 3]) -> Self {
+        self.background = Some(rgb);
+        self
     }
 }
 
@@ -96,6 +110,10 @@ pub struct View<Rend: WindowRenderer> {
     pub active_events: Arc<AtomicRefCell<Vec<BlitzPointerEvent>>>,
     pub animation_timer: Option<Instant>,
     pub is_visible: bool,
+    /// InfEditor patch 17: the color the window is painted with before its first
+    /// frame (`WindowConfig::with_background`), kept so the same paint can be
+    /// used while the window is being torn down (see `paint_background`).
+    background: Option<[u8; 3]>,
     pub safe_area_insets: PhysicalInsets<u32>,
 
     #[cfg(target_arch = "wasm32")]
@@ -140,6 +158,9 @@ impl<Rend: WindowRenderer> View<Rend> {
         // We create window as invisble and then later make window visible
         // after AccessKit has initialised to avoid AccessKit panics
         let is_visible = config.attributes.visible;
+        // InfEditor patch 17: the color painted before the first frame (see
+        // `prepaint`), captured before `config` is destructured below.
+        let background = config.background;
         // Capture the requested surface size before consuming `attributes`, so we can
         // seed the viewport on platforms (winit-web) that report `surface_size() == 0×0`
         // until a layout pass fires.
@@ -150,8 +171,37 @@ impl<Rend: WindowRenderer> View<Rend> {
         #[cfg(feature = "accessibility")]
         let accessibility = AccessibilityState::new(&*winit_window, proxy.clone());
 
+        // InfEditor patch 17: give the window a theme-colored client area
+        // before it becomes visible.
+        //
+        // Showing a window that has no pixels yet is what produces the white
+        // (or, with a premultiplied swapchain, see-through) first screen:
+        // neither Win32 nor winit paints anything before the renderer's first
+        // present, and the window class has no background brush, so the
+        // compositor has nothing to show but the unpainted surface.
+        //
+        // Two halves, in this order (see `prepaint`): the class brush goes in
+        // *before* the show — showing invalidates the client area and the
+        // system asks for the background right after — and the client fill runs
+        // *after* the show, because showing discards anything painted into a
+        // still-hidden window.
+        crate::prepaint::prepare(winit_window.as_ref(), background);
+        // The show itself is animated by the compositor (Windows fades a new
+        // top-level window in for ~100ms, i.e. composites it at partial
+        // opacity), which would let the desktop show through an otherwise
+        // correctly painted first screen. Pin it off for this window — only when
+        // a background was configured, so `with_background` stays the single
+        // switch for the whole patch (`None` = upstream behavior).
+        if background.is_some() {
+            crate::prepaint::suppress_show_transition(winit_window.as_ref());
+        }
+
         if is_visible {
-            winit_window.set_visible(true);
+            // Show with the background already painted (the fill runs between
+            // the show and the moment the window re-enters the composition, see
+            // `prepaint`). `is_visible == false` (popups) keeps the upstream
+            // behavior: the embedder shows the window itself later.
+            crate::prepaint::show(winit_window.as_ref(), background);
         }
 
         // Create viewport
@@ -227,6 +277,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             resize_timer_scheduled: false,
             pointer_pos: Default::default(),
             is_visible: winit_window.is_visible().unwrap_or(true),
+            background,
             #[cfg(feature = "accessibility")]
             accessibility,
 
@@ -357,7 +408,29 @@ impl<Rend: WindowRenderer> View<Rend> {
             )
         });
 
+        // InfEditor patch 17: the first frame is painted and presented. If the
+        // window was shown before the renderer was ready, this is the moment the
+        // theme-colored background painted in `init` is replaced by real
+        // content — nothing to do here, the surface is already visible.
         self.waker = Some(create_waker(&self.proxy, window_id));
+        true
+    }
+
+    /// InfEditor patch 17 (shutdown half): repaint the client area with the
+    /// window's background color.
+    ///
+    /// [`View::drop`] releases the renderer surface *before* the window and the
+    /// document are dropped ("a GPU surface must not outlive the window"), so
+    /// for the whole teardown DWM composes whatever the HWND holds — an
+    /// unpainted surface, i.e. a white rectangle. The embedder calls this right
+    /// before dropping the application (see `ShellApp`'s destructor), which
+    /// gives the teardown the same theme-colored background the window started
+    /// with. Returns whether anything was painted.
+    pub fn paint_background(&self) -> bool {
+        let Some(rgb) = self.background else {
+            return false;
+        };
+        crate::prepaint::paint(self.window.as_ref(), Some(rgb));
         true
     }
 
