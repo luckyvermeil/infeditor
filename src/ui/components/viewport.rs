@@ -243,7 +243,7 @@ fn fold_marker(collapsed: bool, x: f32) -> (&'static str, f32) {
 // instances, so the table is cached globally once.
 
 /// Number of fixed token-class slots (every `TokenKind` variant except `Col`).
-const TOK_FIXED: usize = 30;
+const TOK_FIXED: usize = 33;
 /// Number of column-palette slots (the length of `COL_*` in `theme.rs`; `Col(i)` takes
 /// `i % 8`).
 const COL_SLOTS: usize = 8;
@@ -283,6 +283,9 @@ const TOK_FIXED_KINDS: [TokenKind; TOK_FIXED] = [
     TokenKind::Quote,
     TokenKind::ListMark,
     TokenKind::Rule,
+    TokenKind::Math,
+    TokenKind::MathDelim,
+    TokenKind::MathCmd,
     TokenKind::Added,
     TokenKind::Removed,
     TokenKind::Meta,
@@ -318,9 +321,12 @@ fn tok_slot(kind: Option<TokenKind>) -> u16 {
         Quote => 24,
         ListMark => 25,
         Rule => 26,
-        Added => 27,
-        Removed => 28,
-        Meta => 29,
+        Math => 27,
+        MathDelim => 28,
+        MathCmd => 29,
+        Added => 30,
+        Removed => 31,
+        Meta => 32,
         Col(i) => (TOK_FIXED + (i as usize % COL_SLOTS)) as u16,
     }
 }

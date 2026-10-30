@@ -42,6 +42,13 @@ pub enum TokenKind {
     Quote,
     ListMark,
     Rule,
+    /// Math formula body (`$…$`, `$$…$$`, `\(…\)`, `\[…\]` — LaTeX source)
+    Math,
+    /// The math delimiters themselves (`$` / `$$` / `\(` / `\)` …), dimmed so
+    /// the formula reads without the fences shouting
+    MathDelim,
+    /// A LaTeX command inside a formula (`\frac`, `\alpha`, `\text`, `\\`)
+    MathCmd,
     // --- diff ---
     Added,
     Removed,

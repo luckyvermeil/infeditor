@@ -34,6 +34,7 @@
 | CSV table view (RFC 4180) | ✅ Done |
 | Non-standard math macro normalization (`\lt`/`\pmod` etc.) | ✅ Done |
 | Markdown-escaped LaTeX compatibility (`x\_n`, `\\geq`, `\left{` render) | ✅ Done |
+| Math highlighting in the Markdown source (`$…$`, `$$…$$` and `\[…\]` incl. multi-line blocks, `\(…\)` / `\\(…\\)`; commands / numbers / operators / braces / `%` comments / `\text{}` colored inside the formula; active in paragraphs, headings, block quotes, list items and table cells, and a display fence also works behind a `>` or list prefix) | ✅ Done; a block opener may carry the formula's first line (`$$ f(x) …`), an unterminated block runs to the end of the file like an unterminated fence, and inline math never crosses a line — a cross-line `\(…\)`, which the preview still typesets, stays uncolored rather than swallowing the file |
 | Multi-click selection (double-click word / triple-click line) | ✅ Done |
 | Column (rectangular) selection and editing (typing / cut / paste per column) | ✅ Done |
 | Bracket matching (Ctrl+P to jump) | ✅ Done |

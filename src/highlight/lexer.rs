@@ -31,6 +31,8 @@ pub const M_RAW: u8 = 3;
 pub const M_TRIPLE: u8 = 4;
 pub const M_FENCE: u8 = 5;
 pub const M_XMLC: u8 = 6;
+/// inside a `$$ … $$` display-math block (markdown)
+pub const M_MATH: u8 = 7;
 
 impl LexState {
     pub const fn normal() -> Self {
@@ -81,6 +83,17 @@ impl LexState {
             mode: M_XMLC,
             a: 0,
             b: 0,
+        }
+    }
+    /// Inside a display-math block: `a` is the closer byte (`0` for a `$$`
+    /// block, `]` for one opened by `\[`), `b` the backslash-run length of the
+    /// closer (`0` when the closer has no backslash). Kept in the state so a
+    /// `\[` block closed by `\]` can never be ended by a `$$` and vice versa.
+    pub const fn math_block(close: u8, run: u8) -> Self {
+        LexState {
+            mode: M_MATH,
+            a: close as u16,
+            b: run,
         }
     }
 }
@@ -220,6 +233,10 @@ fn scan_number(b: &[u8], i: usize) -> usize {
 struct Emit<'a> {
     out: &'a mut Vec<Token>,
     plain: usize,
+    /// Kind filled into the stretches the scan did not color: `Plain` in a
+    /// paragraph, but `Heading` / `Quote` / `Col(n)` when a block construct owns
+    /// the text and only a formula is allowed to punch through.
+    base: TokenKind,
 }
 
 impl<'a> Emit<'a> {
@@ -227,11 +244,19 @@ impl<'a> Emit<'a> {
         if e <= s {
             return;
         }
+        // Tokens must be emitted left to right: a start behind the previous end
+        // would overlap a span already pushed (the gap fill above only covers
+        // starts *ahead* of it), and the painter would restyle half a token.
+        debug_assert!(
+            s >= self.plain,
+            "token {s}..{e} starts before the previous end {}",
+            self.plain
+        );
         if s > self.plain {
             self.out.push(Token {
                 start: self.plain,
                 end: s,
-                kind: TokenKind::Plain,
+                kind: self.base,
             });
         }
         self.out.push(Token {
@@ -246,7 +271,7 @@ impl<'a> Emit<'a> {
             self.out.push(Token {
                 start: self.plain,
                 end: n,
-                kind: TokenKind::Plain,
+                kind: self.base,
             });
         }
     }
@@ -256,7 +281,11 @@ impl<'a> Emit<'a> {
 
 fn lex_markdown(b: &[u8], st: LexState, out: &mut Vec<Token>) -> LexState {
     let n = b.len();
-    let mut e = Emit { out, plain: 0 };
+    let mut e = Emit {
+        out,
+        plain: 0,
+        base: TokenKind::Plain,
+    };
 
     // inside a fenced code block
     if st.mode == M_FENCE {
@@ -281,6 +310,46 @@ fn lex_markdown(b: &[u8], st: LexState, out: &mut Vec<Token>) -> LexState {
         return st;
     }
 
+    // inside a display-math block: `$$ … $$`, or `\[ … \]` / `\\[ … \\]`
+    if st.mode == M_MATH {
+        let close = st.a as u8;
+        let run = st.b as usize;
+        // A quoted block keeps its `>` markers on every line: they own the start
+        // of the line while the formula owns the rest, and gold markers would
+        // read as part of the formula. A list item's continuation lines are only
+        // indented, so there is nothing to keep.
+        let q = quote_prefix(b);
+        if q > 0 {
+            e.tok(0, q, TokenKind::Quote);
+        }
+        let hit = if close == 0 {
+            find_math_close(b, q).map(|c| (c, 2))
+        } else {
+            find_escaped_close(b, q, n, run, close).map(|c| (c, run + 1))
+        };
+        return match hit {
+            Some((c, len)) => {
+                math_span(b, q, c, &mut e);
+                e.tok(c, c + len, TokenKind::MathDelim);
+                // whatever trails the closing fence is ordinary inline markdown,
+                // and on a quote line it stays quote-colored
+                if q > 0 {
+                    e.base = TokenKind::Quote;
+                    inline_md(b, c + len, n, &mut e, true);
+                } else {
+                    inline_md(b, c + len, n, &mut e, false);
+                }
+                e.finish(n);
+                LexState::normal()
+            }
+            None => {
+                math_span(b, q, n, &mut e);
+                e.finish(n);
+                st
+            }
+        };
+    }
+
     // fenced block opener
     let mut j = 0;
     while j < n && is_space(b[j]) {
@@ -298,6 +367,47 @@ fn lex_markdown(b: &[u8], st: LexState, out: &mut Vec<Token>) -> LexState {
         }
     }
 
+    // display math `$$ … $$` / `\[ … \]`: closes on the same line, or carries
+    // `M_MATH` until the line holding the closing fence.
+    //
+    // The opener may carry content. `$$ f(x) …` with the closer on a later line
+    // is how converters and hand-written LaTeX spell a display formula most of
+    // the time; requiring the fence to stand alone would leave exactly that case
+    // uncolored. An unterminated block therefore runs to EOF, the same contract
+    // an unterminated fence already has.
+    //
+    // The fence is looked for at the line's own content start, not at column 0:
+    // `> $$ … $$` quotes a derivation and a list item's formula is indented.
+    // Without that the quoted opener stays text while its closing `$$` (a bare
+    // line) opens a block that swallows everything after it.
+    let (content, prefix) = block_prefix(b);
+    if let Some((open_end, close, run)) = math_fence_at(b, content) {
+        if let Some(k) = prefix {
+            e.tok(0, content, k);
+        }
+        e.tok(content, open_end, TokenKind::MathDelim);
+        let (c, len) = match math_fence_close(b, open_end, close, run) {
+            Some(hit) => hit,
+            None => {
+                math_span(b, open_end, n, &mut e);
+                e.finish(n);
+                return LexState::math_block(close, run as u8);
+            }
+        };
+        math_span(b, open_end, c, &mut e);
+        e.tok(c, c + len, TokenKind::MathDelim);
+        // whatever trails the closing fence is ordinary inline markdown, and on
+        // a quote line it stays quote-colored
+        if prefix == Some(TokenKind::Quote) {
+            e.base = TokenKind::Quote;
+            inline_md(b, c + len, n, &mut e, true);
+        } else {
+            inline_md(b, c + len, n, &mut e, false);
+        }
+        e.finish(n);
+        return LexState::normal();
+    }
+
     let line = std::str::from_utf8(b).unwrap_or("");
 
     // ATX heading
@@ -307,7 +417,11 @@ fn lex_markdown(b: &[u8], st: LexState, out: &mut Vec<Token>) -> LexState {
             k += 1;
         }
         if k - j <= 6 && (k >= n || is_space(b[k])) {
-            e.tok(0, n, TokenKind::Heading);
+            // A formula keeps its own colors inside the heading; the rest of the
+            // inline vocabulary (`**bold**`, `code`, links) still does not — a
+            // bold word would switch to the body palette mid-heading.
+            e.base = TokenKind::Heading;
+            inline_md(b, 0, n, &mut e, true);
             e.finish(n);
             return LexState::normal();
         }
@@ -328,7 +442,10 @@ fn lex_markdown(b: &[u8], st: LexState, out: &mut Vec<Token>) -> LexState {
 
     // block quote
     if j < n && b[j] == b'>' {
-        e.tok(0, n, TokenKind::Quote);
+        // same deal as the heading: math keeps its colors, everything else stays
+        // quote-colored
+        e.base = TokenKind::Quote;
+        inline_md(b, 0, n, &mut e, true);
         e.finish(n);
         return LexState::normal();
     }
@@ -340,6 +457,8 @@ fn lex_markdown(b: &[u8], st: LexState, out: &mut Vec<Token>) -> LexState {
         while i < n {
             let c = b[i];
             if c == b'|' {
+                // the gap before the bar still belongs to the cell it closes
+                e.base = TokenKind::Col(col);
                 e.tok(i, i + 1, TokenKind::Punct);
                 col = col.wrapping_add(1);
                 i += 1;
@@ -353,7 +472,8 @@ fn lex_markdown(b: &[u8], st: LexState, out: &mut Vec<Token>) -> LexState {
                 }
                 i += clen(b, i);
             }
-            e.tok(s, i, TokenKind::Col(col));
+            e.base = TokenKind::Col(col);
+            inline_md(b, s, i, &mut e, true);
         }
         e.finish(n);
         return LexState::normal();
@@ -362,7 +482,7 @@ fn lex_markdown(b: &[u8], st: LexState, out: &mut Vec<Token>) -> LexState {
     // list marker, then inline scan of the remainder
     if j < n && (b[j] == b'-' || b[j] == b'*' || b[j] == b'+') && j + 1 < n && is_space(b[j + 1]) {
         e.tok(j, j + 1, TokenKind::ListMark);
-        inline_md(b, j + 1, &mut e);
+        inline_md(b, j + 1, n, &mut e, false);
         e.finish(n);
         return LexState::normal();
     }
@@ -373,24 +493,80 @@ fn lex_markdown(b: &[u8], st: LexState, out: &mut Vec<Token>) -> LexState {
         }
         if k < n && (b[k] == b'.' || b[k] == b')') && k + 1 < n && is_space(b[k + 1]) {
             e.tok(j, k + 1, TokenKind::ListMark);
-            inline_md(b, k + 1, &mut e);
+            inline_md(b, k + 1, n, &mut e, false);
             e.finish(n);
             return LexState::normal();
         }
     }
 
-    inline_md(b, 0, &mut e);
+    inline_md(b, 0, n, &mut e, false);
     e.finish(n);
     LexState::normal()
 }
 
-/// Inline markdown spans: `code`, **bold**, *italic*, [text](url).
-fn inline_md(b: &[u8], from: usize, e: &mut Emit) {
-    let n = b.len();
+/// Inline markdown spans: `code`, **bold**, *italic*, [text](url), math.
+///
+/// Scans `[from, to)` — a table cell passes its own range so a `$` can never
+/// pair across the `|` that ends it. `math_only` narrows the scan to formulas,
+/// which is what the block-level constructs want: a heading, a quote and a table
+/// cell paint their own text and only let a formula punch through (running the
+/// whole inline vocabulary there would repaint `**bold**` in the body palette,
+/// inside a heading that is blue and bold).
+fn inline_md(b: &[u8], from: usize, to: usize, e: &mut Emit, math_only: bool) {
+    let n = to.min(b.len());
     let mut i = from;
     while i < n {
         let c = b[i];
-        if c == b'`' {
+        if c == b'\\' && i + 1 < n {
+            // `\(…\)` / `\[…\]` are the MathJax pair the preview normalizes to
+            // `$…$` (see `wysiwyg::chem`), so the source is colored to match.
+            // The export-escaped `\\(…\\)` variant counts too: the preview takes
+            // a backslash run of one or two and demands a closer of the **same**
+            // length (`chem::find_closer`). Every other `\x` is only skipped, so
+            // it cannot open emphasis, code or a formula.
+            //
+            // Only `\[` spans lines (the display fence above); an inline span
+            // here must close before `to`. `chem::normalize` reads the whole
+            // buffer, so a `\(` left open does render in the preview, but
+            // carrying it as state would let one stray `\(` in prose swallow
+            // every following line — the same reason `$…$` never crosses a line.
+            let mut run = 1;
+            while i + run < n && b[i + run] == b'\\' {
+                run += 1;
+            }
+            let close = if run <= 2 && i + run < n {
+                match b[i + run] {
+                    b'(' => Some(b')'),
+                    b'[' => Some(b']'),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(close) = close {
+                if let Some(end) = find_escaped_close(b, i + run + 1, n, run, close) {
+                    e.tok(i, i + run + 1, TokenKind::MathDelim);
+                    math_span(b, i + run + 1, end, e);
+                    e.tok(end, end + run + 1, TokenKind::MathDelim);
+                    i = end + run + 1;
+                    continue;
+                }
+            }
+            i += 1 + clen(b, i + 1);
+            continue;
+        }
+        if c == b'$' {
+            if let Some((body, close, end)) = inline_math_end(b, i, n) {
+                e.tok(i, body, TokenKind::MathDelim);
+                math_span(b, body, close, e);
+                e.tok(close, end, TokenKind::MathDelim);
+                i = end;
+                continue;
+            }
+            i += clen(b, i);
+            continue;
+        }
+        if !math_only && c == b'`' {
             let mut k = i;
             while k < n && b[k] == b'`' {
                 k += 1;
@@ -405,7 +581,7 @@ fn inline_md(b: &[u8], from: usize, e: &mut Emit) {
             i = k;
             continue;
         }
-        if c == b'*' || c == b'_' || c == b'~' {
+        if !math_only && (c == b'*' || c == b'_' || c == b'~') {
             let mut k = i;
             while k < n && b[k] == c {
                 k += 1;
@@ -428,7 +604,7 @@ fn inline_md(b: &[u8], from: usize, e: &mut Emit) {
             i = k;
             continue;
         }
-        if c == b'[' {
+        if !math_only && c == b'[' {
             if let Some(close) = (i + 1..n).find(|&x| b[x] == b']') {
                 if close + 1 < n && b[close + 1] == b'(' {
                     if let Some(end) = (close + 2..n).find(|&x| b[x] == b')') {
@@ -443,11 +619,378 @@ fn inline_md(b: &[u8], from: usize, e: &mut Emit) {
     }
 }
 
+// ---- math ------------------------------------------------------------------
+
+/// Color the inside of one formula, `[from, to)`.
+///
+/// A formula is not one color: `\frac` is a command, `3.14` a number, `+` an
+/// operator, `{}` `^` `_` are structure, and the argument of `\text{…}` is
+/// prose. Everything reuses the ordinary token classes (Number / Operator /
+/// Punct / String / Comment) so a formula reads like the rest of the file;
+/// only commands get a class of their own ([`TokenKind::MathCmd`]) — a bare
+/// [`TokenKind::Math`] run is what variables and spaces are made of, and a `$`
+/// that ended up inside the body keeps the delimiter color.
+///
+/// Tokens are emitted contiguously, with no gaps: the caller is mid-line, and
+/// a gap would be filled with `Plain`, punching the body color out of spaces.
+fn math_span(b: &[u8], from: usize, to: usize, e: &mut Emit) {
+    let n = to.min(b.len());
+    let mut i = from;
+    let mut run = from; // start of the pending "variables / spaces" stretch
+    while i < n {
+        let c = b[i];
+        if c == b'\\' {
+            // A doubled backslash in front of a ≥2-letter name is the
+            // markdown-escaped command (`\\frac`, `\\leq`) that the preview
+            // repairs back to one backslash (`math::repair_markdown_escapes`), so
+            // both bytes belong to the command. `\\` with nothing (or a lone
+            // letter) after it is not repaired there, and must stay the array row
+            // break / a one-character command.
+            let doubled = i + 3 < n
+                && b[i + 1] == b'\\'
+                && b[i + 2].is_ascii_alphabetic()
+                && b[i + 3].is_ascii_alphabetic();
+            let name = if doubled { i + 2 } else { i + 1 };
+            let mut k = name;
+            if k < n && b[k].is_ascii_alphabetic() {
+                while k < n && b[k].is_ascii_alphabetic() {
+                    k += 1;
+                }
+            } else if k < n {
+                k += clen(b, k); // `\\`, `\{`, `\,`: a one-character command
+            }
+            math_plain(run, i, e);
+            e.tok(i, k, TokenKind::MathCmd);
+            i = k;
+            run = k;
+            // `\text{…}` prints its argument as prose, not as symbols
+            if is_text_command(&b[name..k]) && i < n && b[i] == b'{' {
+                if let Some(close) = matching_brace(b, i, n) {
+                    e.tok(i, i + 1, TokenKind::Punct);
+                    e.tok(i + 1, close, TokenKind::String);
+                    e.tok(close, close + 1, TokenKind::Punct);
+                    i = close + 1;
+                    run = i;
+                }
+            }
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let mut k = i + 1;
+            while k < n && (b[k].is_ascii_digit() || b[k] == b'.') {
+                k += 1;
+            }
+            // a trailing `.` is punctuation ("… = 1."), not part of the number
+            while k > i + 1 && b[k - 1] == b'.' {
+                k -= 1;
+            }
+            math_plain(run, i, e);
+            e.tok(i, k, TokenKind::Number);
+            i = k;
+            run = k;
+            continue;
+        }
+        if c == b'%' {
+            // LaTeX comment: to the end of the line
+            math_plain(run, i, e);
+            e.tok(i, n, TokenKind::Comment);
+            return;
+        }
+        let kind = match c {
+            // an unpaired `$` in the body (greedy pairing put it here) is still
+            // a delimiter, not a variable
+            b'$' => TokenKind::MathDelim,
+            b'{' | b'}' | b'(' | b')' | b'[' | b']' | b'^' | b'_' | b'&' | b'|' => TokenKind::Punct,
+            b'+' | b'-' | b'*' | b'/' | b'=' | b'<' | b'>' | b',' | b';' | b':' | b'!' => {
+                TokenKind::Operator
+            }
+            _ => TokenKind::Math,
+        };
+        if kind != TokenKind::Math {
+            math_plain(run, i, e);
+            e.tok(i, i + 1, kind);
+            i += 1;
+            run = i;
+            continue;
+        }
+        i += clen(b, i);
+    }
+    math_plain(run, n, e);
+}
+
+/// Emit the pending "variables / spaces" stretch `[a, b)` as one `Math` token.
+fn math_plain(a: usize, b: usize, e: &mut Emit) {
+    if b > a {
+        e.tok(a, b, TokenKind::Math);
+    }
+}
+
+/// The `}` matching the `{` at `open`, staying inside `[open, to)`.
+fn matching_brace(b: &[u8], open: usize, to: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < to {
+        match b[i] {
+            b'\\' => {
+                i += 1;
+                if i < to {
+                    i += clen(b, i);
+                }
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += clen(b, i);
+    }
+    None
+}
+
+/// Commands whose `{…}` argument is literal text rather than symbols.
+fn is_text_command(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"text" | b"textrm" | b"textbf" | b"textit" | b"texttt" | b"mbox" | b"hbox"
+    )
+}
+
+/// Index of the backslash run that starts the terminator of a `\(…\)` /
+/// `\[…\]` span at or after `from`, staying inside `[from, to)`; `None` when the
+/// span does not close there.
+///
+/// The terminator is exactly `run` backslashes followed by `close` — the same
+/// rule as the preview's `chem::find_closer`, so a `\\)` closes a `\\(` span and
+/// never a single-backslash one. Runs of any other length are stepped over
+/// whole, so a `\\alpha` inside the formula is not mistaken for a closer.
+fn find_escaped_close(b: &[u8], from: usize, to: usize, run: usize, close: u8) -> Option<usize> {
+    let n = to.min(b.len());
+    let mut i = from;
+    while i < n {
+        if b[i] == b'\\' {
+            let mut r = 1;
+            while i + r < n && b[i + r] == b'\\' {
+                r += 1;
+            }
+            if r == run && i + r < n && b[i + r] == close {
+                return Some(i);
+            }
+            i += r;
+            continue;
+        }
+        i += clen(b, i);
+    }
+    None
+}
+
+/// Index of the first `$` of the closing `$$` of a display-math block at or
+/// after `from`, honouring `\$` escapes.
+fn find_math_close(b: &[u8], from: usize) -> Option<usize> {
+    let n = b.len();
+    let mut i = from;
+    while i < n {
+        if b[i] == b'\\' {
+            i += 1;
+            if i < n {
+                i += clen(b, i);
+            }
+            continue;
+        }
+        if b[i] == b'$' && i + 1 < n && b[i + 1] == b'$' {
+            return Some(i);
+        }
+        i += clen(b, i);
+    }
+    None
+}
+
+/// `\[` / `\\[` starting at `j`: the cross-line display opener, as
+/// `(backslash run, closer byte)`. `\(` is deliberately absent — inline math does
+/// not run past the end of its line.
+fn escaped_math_open(b: &[u8], j: usize) -> Option<(usize, u8)> {
+    if b.get(j) != Some(&b'\\') {
+        return None;
+    }
+    let mut run = 1;
+    while j + run < b.len() && b[j + run] == b'\\' {
+        run += 1;
+    }
+    if run <= 2 && b.get(j + run) == Some(&b'[') {
+        Some((run, b']'))
+    } else {
+        None
+    }
+}
+
+/// The display fence at `i`: `(index past the opening fence, closer byte,
+/// backslash run)`.
+///
+/// `close == 0` is the `$$` pair — its closer is another `$$`, which is why the
+/// run is `0` there (see [`math_fence_close`]); otherwise the fence is a
+/// backslash run plus `[` and closes on `]`, exactly like the preview's
+/// `chem::normalize` reads it.
+fn math_fence_at(b: &[u8], i: usize) -> Option<(usize, u8, usize)> {
+    if b.get(i) == Some(&b'$') && b.get(i + 1) == Some(&b'$') {
+        return Some((i + 2, 0, 0));
+    }
+    escaped_math_open(b, i).map(|(run, close)| (i + run + 1, close, run))
+}
+
+/// The closing fence of the display block opened at `open_end`, when it sits on
+/// the same line: `(index, length)`. `None` means the block runs past EOL.
+fn math_fence_close(b: &[u8], open_end: usize, close: u8, run: usize) -> Option<(usize, usize)> {
+    if close == 0 {
+        find_math_close(b, open_end).map(|c| (c, 2))
+    } else {
+        find_escaped_close(b, open_end, b.len(), run, close).map(|c| (c, run + 1))
+    }
+}
+
+/// End of the `>` quote markers at the start of a line (the spaces after them
+/// included); `0` when the line is not a quote line.
+fn quote_prefix(b: &[u8]) -> usize {
+    let n = b.len();
+    let mut i = 0usize;
+    let mut quoted = false;
+    loop {
+        while i < n && is_space(b[i]) {
+            i += 1;
+        }
+        if i < n && b[i] == b'>' {
+            i += 1;
+            quoted = true;
+            continue;
+        }
+        break;
+    }
+    if quoted {
+        i
+    } else {
+        0
+    }
+}
+
+/// Where a line's own content starts, after the block prefixes a paragraph may
+/// carry — indentation, `>` quote markers and a list marker — together with the
+/// kind that paints that run (`Quote` once a `>` showed up, `ListMark` for a
+/// bare list item). `None` means "no prefix", so a plain line takes the same
+/// path it always did.
+fn block_prefix(b: &[u8]) -> (usize, Option<TokenKind>) {
+    let n = b.len();
+    let mut i = 0usize;
+    let mut kind: Option<TokenKind> = None;
+    loop {
+        while i < n && is_space(b[i]) {
+            i += 1;
+        }
+        if i < n && b[i] == b'>' {
+            i += 1;
+            kind = Some(TokenKind::Quote);
+            continue;
+        }
+        match list_marker_len(b, i) {
+            Some(len) => {
+                i += len;
+                if kind.is_none() {
+                    kind = Some(TokenKind::ListMark);
+                }
+            }
+            None => return (i, kind),
+        }
+    }
+}
+
+/// Length of the list marker at `i` (`- `, `* `, `+ `, `1. `, `1) `), the space
+/// that must follow it included; `None` when there is none.
+fn list_marker_len(b: &[u8], i: usize) -> Option<usize> {
+    let n = b.len();
+    let c = *b.get(i)?;
+    if c == b'-' || c == b'*' || c == b'+' {
+        return (i + 1 < n && is_space(b[i + 1])).then_some(2);
+    }
+    if !c.is_ascii_digit() {
+        return None;
+    }
+    let mut k = i;
+    while k < n && b[k].is_ascii_digit() {
+        k += 1;
+    }
+    let closed = k < n && (b[k] == b'.' || b[k] == b')') && k + 1 < n && is_space(b[k + 1]);
+    closed.then_some(k + 2 - i)
+}
+
+/// Inline math starting at `i` (a `$`). Returns
+/// `(body_start, body_end, end)`, `end` being the index just past the closing
+/// delimiter.
+///
+/// The guards are the ones Typora/Obsidian and KaTeX auto-render use, chosen so
+/// that money in prose never turns into a formula: the opener is `$` or `$$`
+/// (display math written on one line), nothing whitespace follows the opener,
+/// nothing whitespace precedes the closer, and a single-`$` closer is not
+/// followed by a digit — `$5 and $10` therefore stays text. `\$` is an escape,
+/// never a delimiter. This function never crosses the end of its range: it is
+/// the inline scan of a row, and a display block running past the end of the
+/// line is carried by [`M_MATH`] instead.
+fn inline_math_end(b: &[u8], i: usize, to: usize) -> Option<(usize, usize, usize)> {
+    let n = to.min(b.len());
+    if i >= n || b[i] != b'$' {
+        return None;
+    }
+    let open = if i + 1 < n && b[i + 1] == b'$' { 2 } else { 1 };
+    let start = i + open;
+    if start >= n || is_space(b[start]) {
+        return None;
+    }
+    let mut j = start;
+    while j < n {
+        if b[j] == b'\\' {
+            j += 1;
+            if j < n {
+                j += clen(b, j);
+            }
+            continue;
+        }
+        if b[j] == b'$' {
+            // `$$…` closes only on `$$`; a lone `$` is part of the formula
+            let close = if j + 1 < n && b[j + 1] == b'$' {
+                2
+            } else if open == 1 {
+                1
+            } else {
+                0
+            };
+            if close == 0 {
+                j += 1;
+                continue;
+            }
+            let tight = j > start && !is_space(b[j - 1]);
+            let not_money = close == 2 || !(j + 1 < n && b[j + 1].is_ascii_digit());
+            if tight && not_money {
+                return Some((start, j, j + close));
+            }
+            // not a closer — a later `$` may still pair up with this opener
+            j += close;
+            continue;
+        }
+        j += clen(b, j);
+    }
+    None
+}
+
 // ---- diff ------------------------------------------------------------------
 
 fn lex_diff(b: &[u8], out: &mut Vec<Token>) -> LexState {
     let n = b.len();
-    let mut e = Emit { out, plain: 0 };
+    let mut e = Emit {
+        out,
+        plain: 0,
+        base: TokenKind::Plain,
+    };
     let kind = if starts_with(b, 0, "+++")
         || starts_with(b, 0, "---")
         || starts_with(b, 0, "@@")
@@ -476,7 +1019,11 @@ fn lex_diff(b: &[u8], out: &mut Vec<Token>) -> LexState {
 
 fn lex_csv(b: &[u8], spec: CsvSpec, out: &mut Vec<Token>) -> LexState {
     let n = b.len();
-    let mut e = Emit { out, plain: 0 };
+    let mut e = Emit {
+        out,
+        plain: 0,
+        base: TokenKind::Plain,
+    };
     let mut i = 0usize;
     let mut col = 0u8;
     while i < n {
@@ -944,7 +1491,11 @@ pub fn lex_line(spec: &LangSpec, line: &str, st: LexState, out: &mut Vec<Token>)
 
     let b = line.as_bytes();
     let n = b.len();
-    let mut e = Emit { out, plain: 0 };
+    let mut e = Emit {
+        out,
+        plain: 0,
+        base: TokenKind::Plain,
+    };
     let mut i = match resume_multiline(spec, b, st, &mut e) {
         Resumed::At(j) => j,
         Resumed::Open(s) => return s,
@@ -1550,6 +2101,407 @@ mod tests {
         assert_eq!(kind_at(&t[0], 0), TokenKind::Punct);
         assert_eq!(kind_at(&t[0], 2), TokenKind::Col(1));
         assert_eq!(kind_at(&t[0], 6), TokenKind::Col(2));
+    }
+
+    /// `$…$`: the body is Math, the `$` pair MathDelim, and the surrounding
+    /// prose keeps its default color.
+    #[test]
+    fn markdown_inline_math() {
+        let spec = by_name("Markdown");
+        let line = "设 $E = mc^2$ 为质能方程";
+        let open = line.find('$').unwrap();
+        let close = line.rfind('$').unwrap();
+        let (t, st) = toks(spec, &[line]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::Plain);
+        assert_eq!(kind_at(&t[0], open), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], open + 1), TokenKind::Math);
+        assert_eq!(kind_at(&t[0], close - 1), TokenKind::Number);
+        assert_eq!(kind_at(&t[0], close), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], close + 1), TokenKind::Plain);
+        assert_eq!(st, LexState::normal());
+    }
+
+    /// Money in prose stays text — the guards come from KaTeX auto-render:
+    /// nothing whitespace after the opener, nothing whitespace before the
+    /// closer, and a `$` closer not followed by a digit.
+    #[test]
+    fn markdown_money_is_not_math() {
+        let spec = by_name("Markdown");
+        let (t, _) = toks(spec, &["价格 $5 到 $10 元", "costs $5 or $10 today"]);
+        for (i, row) in t.iter().enumerate() {
+            assert!(
+                !row.iter()
+                    .any(|k| matches!(k.kind, TokenKind::Math | TokenKind::MathDelim)),
+                "line {i} must not be colored as a formula: {row:?}"
+            );
+        }
+    }
+
+    /// `\$` escapes the dollar, so it never opens a formula.
+    #[test]
+    fn markdown_escaped_dollar_is_text() {
+        let spec = by_name("Markdown");
+        let (t, _) = toks(spec, &[r"price \$5 and \$10 \$"]);
+        assert!(!t[0]
+            .iter()
+            .any(|k| matches!(k.kind, TokenKind::Math | TokenKind::MathDelim)));
+    }
+
+    /// A `$$` line opens a block that runs to the next `$$` line; the opener
+    /// and closer are delimiters, every line in between is Math.
+    #[test]
+    fn markdown_display_math_block() {
+        let spec = by_name("Markdown");
+        let (t, st) = toks(spec, &["$$", "E = mc^2", "\\frac{a}{b}", "$$", "after"]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[1], 0), TokenKind::Math);
+        assert_eq!(kind_at(&t[2], 0), TokenKind::MathCmd);
+        assert_eq!(kind_at(&t[3], 0), TokenKind::MathDelim);
+        assert_eq!(st, LexState::normal());
+        assert_eq!(kind_at(&t[4], 0), TokenKind::Plain);
+    }
+
+    /// Display math written on one line: `$$a^2$$` — and the text after the
+    /// closer is scanned as ordinary inline markdown again.
+    #[test]
+    fn markdown_one_line_display_math() {
+        let spec = by_name("Markdown");
+        let (t, st) = toks(spec, &["$$a^2$$ **tail**"]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], 2), TokenKind::Math);
+        assert_eq!(kind_at(&t[0], 6), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], 9), TokenKind::Bold);
+        assert_eq!(st, LexState::normal());
+    }
+
+    /// Math inside a fenced code block is code, not math.
+    #[test]
+    fn markdown_math_inside_fence_stays_code() {
+        let spec = by_name("Markdown");
+        let (t, _) = toks(spec, &["```", "$x$ and $$y$$", "```"]);
+        assert_eq!(kind_at(&t[1], 0), TokenKind::Code);
+        assert_eq!(kind_at(&t[1], 10), TokenKind::Code);
+    }
+
+    /// The preview normalizes MathJax's `\(…\)` / `\[…\]` to `$…$`
+    /// (`wysiwyg::chem`), so the source colors them the same way — including
+    /// the `\command` pairs that sit inside the formula.
+    #[test]
+    fn markdown_mathjax_delimiters() {
+        let spec = by_name("Markdown");
+        let line = r"inline \(\mathrm{H_2O}\) and display \[x^2\]";
+        let (t, _) = toks(spec, &[line]);
+        let open = line.find(r"\(").unwrap();
+        let close = line.find(r"\)").unwrap();
+        let dopen = line.find(r"\[").unwrap();
+        let dclose = line.find(r"\]").unwrap();
+        assert_eq!(kind_at(&t[0], open), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], open + 2), TokenKind::MathCmd); // \mathrm
+        assert_eq!(kind_at(&t[0], close), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], dopen), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], dopen + 2), TokenKind::Math);
+        assert_eq!(kind_at(&t[0], dclose), TokenKind::MathDelim);
+    }
+
+    /// Inside a formula the parts keep their own classes: commands, numbers,
+    /// operators, braces, and the prose argument of `\text{…}`.
+    #[test]
+    fn markdown_math_inner_coloring() {
+        let spec = by_name("Markdown");
+        let line = r"$\frac{a+b}{2} \le \text{当且仅当} x_1^2$";
+        let (t, _) = toks(spec, &[line]);
+        let at = |pat: &str, off: usize| kind_at(&t[0], line.find(pat).unwrap() + off);
+        assert_eq!(at(r"\frac", 0), TokenKind::MathCmd);
+        assert_eq!(at("a+b", 0), TokenKind::Math); // variable
+        assert_eq!(at("a+b", 1), TokenKind::Operator); // +
+        assert_eq!(at("{a", 0), TokenKind::Punct); // {
+        assert_eq!(at("2}", 0), TokenKind::Number);
+        assert_eq!(at(r"\le", 0), TokenKind::MathCmd);
+        assert_eq!(at("当且", 0), TokenKind::String); // \text{…} argument
+        assert_eq!(at("x_1", 0), TokenKind::Math);
+        assert_eq!(at("_1", 0), TokenKind::Punct);
+        assert_eq!(at("^2", 1), TokenKind::Number); // superscript
+    }
+
+    /// The `$$` opener may carry the first line of the formula — `$$ f(x) …`
+    /// with the closer on a later line is the shape converters emit, and it must
+    /// color like the fence-alone form.
+    #[test]
+    fn markdown_display_math_with_content_on_the_opener_line() {
+        let spec = by_name("Markdown");
+        let (t, st) = toks(
+            spec,
+            &[
+                r"$$ f(x) \\leq \frac{1}{(2 n+2)(2 n+3)}",
+                "x^2",
+                "$$",
+                "after",
+            ],
+        );
+        assert_eq!(kind_at(&t[0], 0), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], 3), TokenKind::Math); // `f`
+        assert_eq!(kind_at(&t[1], 0), TokenKind::Math);
+        assert_eq!(kind_at(&t[2], 0), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[3], 0), TokenKind::Plain);
+        assert_eq!(st, LexState::normal());
+
+        // …and the fence alone on its line still works
+        let (t, _) = toks(spec, &["$$", "x", "$$"]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[1], 0), TokenKind::Math);
+    }
+
+    /// An unterminated display block runs to EOF — the same contract an
+    /// unterminated fence has, and what makes the opener a line-start decision.
+    #[test]
+    fn markdown_unterminated_display_math_runs_to_eof() {
+        let spec = by_name("Markdown");
+        let (t, st) = toks(spec, &["$$ f(x)", "x = 1", "still math"]);
+        assert_eq!(kind_at(&t[1], 0), TokenKind::Math);
+        assert_eq!(kind_at(&t[2], 0), TokenKind::Math);
+        assert_eq!(st.mode, M_MATH);
+    }
+
+    /// The escaped command form survives the color: `\\leq` is one command, like
+    /// `\leq`, because the preview repairs the doubled backslash before
+    /// typesetting (`math::repair_markdown_escapes`). `\\` on its own stays the
+    /// array row break.
+    #[test]
+    fn markdown_escaped_command_inside_formula() {
+        let spec = by_name("Markdown");
+        let line = r"$a \\leq b \\ c$";
+        let (t, _) = toks(spec, &[line]);
+        let at = |pat: &str, off: usize| kind_at(&t[0], line.find(pat).unwrap() + off);
+        assert_eq!(at(r"\\leq", 0), TokenKind::MathCmd); // the doubled backslash
+        assert_eq!(at(r"\\leq", 1), TokenKind::MathCmd);
+        assert_eq!(at(r"\\leq", 2), TokenKind::MathCmd); // `l`
+        assert_eq!(at(r"\\leq", 4), TokenKind::MathCmd); // `q` — all one token
+        assert_eq!(at(r"\\ c", 1), TokenKind::MathCmd); // row break `\\`
+        assert_eq!(at(r"\\ c", 3), TokenKind::Math); // plain variable after it
+    }
+
+    /// The export-escaped `\\(…\\)` variant: the preview normalizes a backslash
+    /// run of one or two and demands a closer of the **same** length
+    /// (`chem::find_closer`), so the source must accept it too.
+    #[test]
+    fn markdown_double_backslash_mathjax() {
+        let spec = by_name("Markdown");
+        let line = r"see \\(x^2\\) now";
+        let (t, _) = toks(spec, &[line]);
+        let open = line.find(r"\\(").unwrap();
+        let close = line.find(r"\\)").unwrap();
+        assert_eq!(kind_at(&t[0], open), TokenKind::MathDelim); // both backslashes
+        assert_eq!(kind_at(&t[0], open + 2), TokenKind::MathDelim); // (
+        assert_eq!(kind_at(&t[0], open + 3), TokenKind::Math); // x
+        assert_eq!(kind_at(&t[0], close), TokenKind::MathDelim); // both backslashes
+        assert_eq!(kind_at(&t[0], close + 2), TokenKind::MathDelim); // )
+        assert_eq!(kind_at(&t[0], close + 3), TokenKind::Plain); // trailing text
+    }
+
+    /// Greedy pairing can leave an unpaired `$` inside the body; it stays a
+    /// delimiter so it does not read as a variable.
+    #[test]
+    fn markdown_stray_dollar_inside_formula() {
+        let spec = by_name("Markdown");
+        let line = "$a $b$";
+        let (t, _) = toks(spec, &[line]);
+        let inner = line.find("$b").unwrap();
+        assert_eq!(kind_at(&t[0], inner), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], inner + 1), TokenKind::Math);
+    }
+
+    /// A formula punches through the block constructs that otherwise paint the
+    /// whole line: heading, block quote and table cell keep their own color for
+    /// the text around it.
+    #[test]
+    fn markdown_math_inside_blocks() {
+        let spec = by_name("Markdown");
+
+        let h = "## 质能 $E = mc^2$";
+        let open = h.find('$').unwrap();
+        let close = h.rfind('$').unwrap();
+        let (t, _) = toks(spec, &[h]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::Heading); // `##`
+        assert_eq!(kind_at(&t[0], open), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], open + 1), TokenKind::Math);
+        assert_eq!(kind_at(&t[0], close), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], h.len() - 2), TokenKind::Number); // the `2` of `mc^2`
+
+        let q = "> $\\alpha$ 引用";
+        let (t, _) = toks(spec, &[q]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::Quote); // `> `
+        assert_eq!(kind_at(&t[0], 2), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], 3), TokenKind::MathCmd); // \alpha
+        assert_eq!(kind_at(&t[0], q.len() - 1), TokenKind::Quote);
+
+        let r = "| $a$ | b |";
+        let (t, _) = toks(spec, &[r]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::Punct);
+        assert_eq!(kind_at(&t[0], 2), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], 3), TokenKind::Math);
+        assert_eq!(kind_at(&t[0], 6), TokenKind::Punct);
+        assert_eq!(kind_at(&t[0], 8), TokenKind::Col(2)); // second cell keeps its color
+    }
+
+    /// The `math_only` scan must not repaint the rest of the inline vocabulary —
+    /// a bold run inside a heading would otherwise switch to the body palette.
+    #[test]
+    fn markdown_block_math_leaves_other_inline_alone() {
+        let spec = by_name("Markdown");
+        let (t, _) = toks(spec, &["## **bold** and $x$", "> `code` and $x$"]);
+        assert_eq!(kind_at(&t[0], 5), TokenKind::Heading);
+        assert_eq!(kind_at(&t[1], 4), TokenKind::Quote);
+    }
+
+    /// `\[ … \]` is carried across lines — the preview's `chem::normalize` reads
+    /// the whole document, so a display block split over lines must color as one.
+    #[test]
+    fn markdown_escaped_display_math_spans_lines() {
+        let spec = by_name("Markdown");
+        let (t, st) = toks(spec, &[r"\[", r"\frac{a}{b}", "x^2", r"\]", "after"]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[1], 0), TokenKind::MathCmd);
+        assert_eq!(kind_at(&t[2], 0), TokenKind::Math);
+        assert_eq!(kind_at(&t[3], 0), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[4], 0), TokenKind::Plain);
+        assert_eq!(st, LexState::normal());
+    }
+
+    /// The export-escaped `\\[ … \\]` opener carries the run length, so a `\]`
+    /// cannot end a `\\[` block: the closers must match in length.
+    #[test]
+    fn markdown_escaped_display_math_double_backslash() {
+        let spec = by_name("Markdown");
+        let (t, st) = toks(spec, &[r"\\[", "x^2", r"\\]"]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::MathDelim); // both backslashes
+        assert_eq!(kind_at(&t[1], 0), TokenKind::Math);
+        assert_eq!(kind_at(&t[2], 0), TokenKind::MathDelim);
+        assert_eq!(st, LexState::normal());
+    }
+
+    /// A `\[` with prose after it is not a block opener (same rule as `$$`), and a
+    /// `\[ … \]` closed on its own line is still an ordinary inline span.
+    #[test]
+    fn markdown_escaped_math_opener_rules() {
+        let spec = by_name("Markdown");
+        // an opener with content and a later closer is a block, like `$$`
+        let (t, st) = toks(spec, &[r"\[ f(x)", "x^2", r"\]"]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], 3), TokenKind::Math);
+        assert_eq!(kind_at(&t[1], 0), TokenKind::Math);
+        assert_eq!(kind_at(&t[2], 0), TokenKind::MathDelim);
+        assert_eq!(st, LexState::normal());
+
+        // a `\[ … \]` closed on its own line is still an ordinary inline span
+        let line = r"\[x^2\]";
+        let (t, st) = toks(spec, &[line]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], 2), TokenKind::Math);
+        assert_eq!(kind_at(&t[0], 5), TokenKind::MathDelim);
+        assert_eq!(st, LexState::normal());
+    }
+
+    /// A display block inside a block quote or a list item. The fence sits
+    /// behind the prefix, and the closing `$$` must close that block instead of
+    /// opening one of its own — a bare `$$` line used to start a block that
+    /// swallowed everything after it.
+    #[test]
+    fn markdown_display_math_inside_a_quote_and_a_list() {
+        let spec = by_name("Markdown");
+
+        let (t, st) = toks(spec, &["> $$", "> x^2", "> $$", "after"]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::Quote); // the `>` marker
+        assert_eq!(kind_at(&t[0], 2), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[1], 0), TokenKind::Quote); // markers stay gray
+        assert_eq!(kind_at(&t[1], 2), TokenKind::Math);
+        assert_eq!(kind_at(&t[2], 2), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[3], 0), TokenKind::Plain); // nothing swallowed
+        assert_eq!(st, LexState::normal());
+
+        let (t, st) = toks(spec, &["- $$", "  x^2", "  $$", "after"]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::ListMark);
+        assert_eq!(kind_at(&t[0], 2), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[1], 2), TokenKind::Math);
+        assert_eq!(kind_at(&t[2], 2), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[3], 0), TokenKind::Plain);
+        assert_eq!(st, LexState::normal());
+
+        // one line, behind a prefix: the tail stays quote-colored
+        let (t, _) = toks(spec, &["> $$a^2$$ tail"]);
+        assert_eq!(kind_at(&t[0], 0), TokenKind::Quote);
+        assert_eq!(kind_at(&t[0], 2), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], 7), TokenKind::MathDelim);
+        assert_eq!(kind_at(&t[0], 9), TokenKind::Quote);
+    }
+
+    /// `\(…\)` is inline, so it must close before the end of its line: a stray
+    /// `\(` in prose would otherwise swallow the rest of the file. The preview is
+    /// more permissive (its `chem::normalize` reads the whole buffer), and that
+    /// asymmetry is the deliberate half of the trade — a colored formula is worth
+    /// less than a document that does not turn into math after one typo.
+    #[test]
+    fn markdown_inline_math_stays_on_its_line() {
+        let spec = by_name("Markdown");
+        let (t, st) = toks(spec, &[r"see \(", "x^2", r"\) here"]);
+        for (i, row) in t.iter().enumerate() {
+            assert!(
+                !row.iter().any(|k| matches!(
+                    k.kind,
+                    TokenKind::Math | TokenKind::MathDelim | TokenKind::MathCmd
+                )),
+                "line {i} must stay text: {row:?}"
+            );
+        }
+        assert_eq!(st, LexState::normal());
+    }
+
+    /// Every markdown construct must come back as a contiguous token run that
+    /// covers the whole line: the `Emit::base` gap fill (Plain / Heading / Quote /
+    /// Col) has to agree with whatever the branch emits itself, or a styled gap
+    /// would overlap the next token.
+    #[test]
+    fn markdown_tokens_cover_every_line() {
+        let spec = by_name("Markdown");
+        let lines = [
+            "## heading with $x^2$",
+            "> quote with $\\alpha$",
+            "| $a$ | b | $c$ |",
+            "- item with $z$",
+            "1. numbered $w$",
+            "**bold** and $v$ and `code`",
+            "$$",
+            "\\frac{1}{2}",
+            "$$",
+            "\\[",
+            "x_1",
+            "\\]",
+            "> $$",
+            "> x^2",
+            "> $$ tail",
+            "- $$",
+            "  x^2",
+            "  $$",
+            "```",
+            "$fenced$",
+            "```",
+            "$$ f(x) \\leq 1",
+            "x_2",
+            "$$",
+            "",
+            "plain $5 and $10 tail",
+        ];
+        let mut st = LexState::normal();
+        for line in lines {
+            let mut out = Vec::new();
+            st = lex_line(spec, line, st, &mut out);
+            let mut pos = 0;
+            for tk in &out {
+                assert_eq!(tk.start, pos, "gap or overlap on {line:?}: {out:?}");
+                pos = tk.end;
+            }
+            assert_eq!(pos, line.len(), "line not fully covered: {line:?}");
+        }
+        assert_eq!(st, LexState::normal());
     }
 
     #[test]

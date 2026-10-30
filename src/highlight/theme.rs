@@ -347,6 +347,15 @@ impl Theme {
                 Quote => "#8b949e",
                 ListMark => "#ff7b72",
                 Rule => "#79c0ff",
+                // Formulas get their own warm gold so they stand apart from
+                // strings (light blue), numbers (blue) and preprocessor orange;
+                // the `$` fences drop to a muted gray so the expression, not
+                // the delimiters, carries the eye. Inside a formula the ordinary
+                // classes keep their colors (Number / Operator / Punct /
+                // String / Comment) and commands take the function purple.
+                Math => "#e5c07b",
+                MathDelim => "#6e7681",
+                MathCmd => "#d2a8ff",
                 Added => "#7ee787",
                 Removed => "#ff7b72",
                 Meta => "#ff7b72",
@@ -378,6 +387,15 @@ impl Theme {
                 Quote => "#008000",
                 ListMark => "#af00db",
                 Rule => "#000080",
+                // Dark amber, one step below the bookmark's `#c07b00` so a
+                // formula and a marked line never read as the same thing.
+                // Commands take the control-keyword purple. The fence gray is
+                // the gutter's `#8a8a8a`: the old `#9a9a9a` sat at 2.6:1 on
+                // white, under the 3:1 floor, and a single thin glyph needs
+                // more than that to read at all.
+                Math => "#9a6700",
+                MathDelim => "#8a8a8a",
+                MathCmd => "#af00db",
                 Added => "#098658",
                 Removed => "#a31515",
                 Meta => "#0000ff",
