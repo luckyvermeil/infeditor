@@ -1954,6 +1954,101 @@ fn push_escaped_pipes(s: &str, out: &mut String) {
     }
 }
 
+/// The fenced-code delimiters of a block, exactly as [`emit`] writes them:
+/// `(opening_line_with_info, closing_fence)` — e.g. `("```rust", "```")`.
+///
+/// The edit view's **source form** puts them around the code text (as virtual
+/// bytes), so the fence length and the tilde-vs-backtick choice can never drift
+/// from what a copy or a save produces.
+pub fn code_fence_lines(lang: Option<&str>, text: &str) -> (String, String) {
+    // A backtick fence's info string may not contain a backtick, so such a
+    // language tag gets a tilde fence (see `emit_block`).
+    let marker = if lang.is_some_and(|l| l.contains('`')) {
+        '~'
+    } else {
+        '`'
+    };
+    let fence = fence_of(marker, text, lang.unwrap_or(""));
+    let mut open = fence.clone();
+    if let Some(l) = lang {
+        open.push_str(l);
+    }
+    (open, fence)
+}
+
+/// The ATX marker of a heading — `## ` — as the writer emits it. A heading whose
+/// text is empty/whitespace emits the hashes alone (writing the space produced
+/// `##&#32;`, which reparses as a paragraph holding the marker), so the space is
+/// part of the marker only when there is something to separate.
+pub fn heading_marker(level: u8, body_is_empty: bool) -> String {
+    let mut s = "#".repeat(usize::from(level));
+    if !body_is_empty {
+        s.push(' ');
+    }
+    s
+}
+
+/// The Markdown delimiters that wrap **one inline node** — the exact bytes
+/// [`emit`] puts around its content.
+///
+/// The edit view's source expansion (`render` + [`crate::reveal`]) draws these
+/// around a revealed node, and this function is the writer's own rule table:
+/// showing and copying therefore agree byte for byte (a selection shows `**` and
+/// `Ctrl+C` writes `**`).
+///
+/// `None` = no delimiters: plain text, line breaks, an empty container (the
+/// writer emits no markers for a zero-length placeholder — `****` would reparse
+/// as a rule) and a whitespace-only inline formula (`$ $` is literal text).
+///
+/// Known approximation: an image's alt is shown raw while the writer escapes `[`
+/// and `]` inside it (a deliberately fussy CommonMark corner, not worth
+/// mangling the visible text for).
+pub fn inline_delims(i: &Inline) -> Option<(String, String)> {
+    /// A URL exactly as the writer emits it (percent-encoded, `<>`-wrapped when
+    /// it contains spaces — the delimiters must match a copy byte for byte).
+    fn url_emitted(url: &str) -> String {
+        let mut s = String::new();
+        emit_url(url, &mut s);
+        s
+    }
+    match i {
+        Inline::Text(_) | Inline::SoftBreak | Inline::HardBreak => None,
+        Inline::Code(c) => {
+            if c.is_empty() {
+                return None;
+            }
+            let fence = inline_code_fence(c);
+            let pad = code_span_pad(c);
+            let mut open = fence.clone();
+            let mut close = String::new();
+            if pad {
+                open.push(' ');
+                close.push(' ');
+            }
+            close.push_str(&fence);
+            Some((open, close))
+        }
+        Inline::Strong(c) if !c.is_empty() => Some(("**".into(), "**".into())),
+        Inline::Em(c) if !c.is_empty() => Some(("*".into(), "*".into())),
+        Inline::Del(c) if !c.is_empty() => Some(("~~".into(), "~~".into())),
+        Inline::Strong(_) | Inline::Em(_) | Inline::Del(_) => None,
+        Inline::Link { url, inlines: c } if !(c.is_empty() && url.is_empty()) => {
+            Some(("[".into(), format!("]({})", url_emitted(url))))
+        }
+        Inline::Link { .. } => None,
+        Inline::Image { url, .. } => Some(("![".into(), format!("]({})", url_emitted(url)))),
+        Inline::Math { src, display } => {
+            if *display {
+                Some(("$$".into(), "$$".into()))
+            } else if src.trim().is_empty() {
+                None
+            } else {
+                Some(("$".into(), "$".into()))
+            }
+        }
+    }
+}
+
 /// Emit a table cell's content. GFM strips the cell's leading and trailing
 /// whitespace (`parse_table_row_inner` / `parse_line`), so those runs are
 /// entity-escaped the same way block-end spaces are — a cell holding "a " used
@@ -3288,6 +3383,69 @@ mod tests {
         );
         let re = parse(&out);
         assert_eq!(re.blocks[0].plain_text(), s);
+    }
+
+    /// The displayed delimiters must be **exactly** what a copy writes: the edit
+    /// view shows `open + content + close` around a revealed node, and the
+    /// clipboard gets `emit`'s output. Round-tripping through both is the only
+    /// guarantee that "what you see is what you copy".
+    #[test]
+    fn inline_delims_match_emit_byte_for_byte() {
+        let samples: Vec<Inline> = vec![
+            Inline::Strong(vec![Inline::Text("bold".into())]),
+            Inline::Em(vec![Inline::Text("it".into())]),
+            Inline::Del(vec![Inline::Text("gone".into())]),
+            Inline::Code("code".into()),
+            Inline::Code("`".into()),
+            Inline::Code("`x`".into()),
+            Inline::Code(" ".into()),
+            Inline::Link {
+                url: "https://e.com/a b".into(),
+                inlines: vec![Inline::Text("t".into())],
+            },
+            Inline::Link {
+                url: String::new(),
+                inlines: vec![Inline::Text("empty".into())],
+            },
+            Inline::Image {
+                url: "./p.png".into(),
+                alt: "alt".into(),
+            },
+            Inline::Math {
+                src: "x^2".into(),
+                display: false,
+            },
+            Inline::Math {
+                src: "\ny\n".into(),
+                display: true,
+            },
+        ];
+        for i in samples {
+            let Some((open, close)) = inline_delims(&i) else {
+                panic!("{i:?} must have delimiters");
+            };
+            let doc = Doc::new(vec![Block::Para(vec![i.clone()])]);
+            let shown = format!("{open}{}{close}", i.plain());
+            // A display formula carries the line breaks of its own source.
+            let emitted = emit(&doc);
+            let emitted = emitted.trim_end_matches('\n');
+            assert_eq!(shown, emitted, "delimiters of {i:?}");
+        }
+        // No delimiters: plain text, line breaks, a zero-length placeholder
+        // container (`****` would reparse as a rule) and a whitespace-only inline
+        // formula (`$ $` is literal text).
+        for i in [
+            Inline::Text("t".into()),
+            Inline::SoftBreak,
+            Inline::HardBreak,
+            Inline::Strong(Vec::new()),
+            Inline::Math {
+                src: " ".into(),
+                display: false,
+            },
+        ] {
+            assert!(inline_delims(&i).is_none(), "{i:?}");
+        }
     }
 
     /// The inline code fence = the longest run of backticks in the content + 1; pad

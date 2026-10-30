@@ -578,7 +578,16 @@ fn window_events(
                         st.touch_press.is_some(),
                     )
                 };
-                if has_drag || has_press {
+                // A document-view drag whose release the component never saw (the
+                // pointer left the element or the window, so no DOM `pointerup`
+                // arrived): the editor would stay in pointer-owned mode — every later
+                // selection would expand blocks by block range, and the floating
+                // toolbar (hidden while `md_drag`) would never come back. Ends it
+                // here, and the answer decides whether this release needs the state
+                // write below (an ordinary click's WYS press sets `md_drag` too, so
+                // "WYS is pressed" alone must not mark the app dirty).
+                let wys_drag = crate::ui::components::mdws::end_wys_drag();
+                if has_drag || has_press || wys_drag {
                     let mut st = state.write();
                     // Land the newest drag sample first, so the content
                     // matches the thumb the user let go of (the frame hook
@@ -951,7 +960,11 @@ fn window_events(
             // caret stays pinned at its old position — blitz builds inline
             // layout later in this frame's render pass and is only
             // queryable next frame.
-            if crate::ui::components::mdws::overlays_frame(state.read().tab().md_wys) {
+            let (wys_view, dragging) = {
+                let st = state.read();
+                (st.tab().md_wys, st.md_drag)
+            };
+            if crate::ui::components::mdws::overlays_frame(wys_view, dragging) {
                 window.request_redraw();
             }
             if state.read().quit_requested {

@@ -23,6 +23,17 @@ impl Editor {
         let mut out: Vec<Block> = Vec::new();
         if sb == eb {
             let b = &self.doc.blocks[sb];
+            // A range that stays **inside** one atom whose source is on screen copies
+            // those bytes. Re-emitting the truncated node would hand the clipboard a
+            // broken formula (`$+y$`) or a broken image (`![MG](u)`) — the user
+            // selected text, and the text is what they get.
+            if let Some((s, e)) = self.reveal().editing_span(sb) {
+                if s <= start.off && end.off <= e {
+                    let plain = b.plain_text();
+                    let (a, z) = clamp_span(&plain, start.off, end.off);
+                    return plain[a..z].to_string();
+                }
+            }
             let inl = block_src_inlines(b);
             let len = b_plain(&inl).len();
             if start.off == 0 && end.off >= len {
@@ -118,12 +129,15 @@ impl Editor {
             }
         }
         let focus = self.sel.focus;
+        // The formula whose source is on screen is text, not an atom (its interior
+        // offsets are real caret positions).
+        let edit = self.reveal().editing_span(focus.block);
         let doc = &self.doc;
         let new = match m {
-            Move::Left => move_left(doc, focus),
-            Move::Right => move_right(doc, focus),
-            Move::WordLeft => move_word_left(doc, focus),
-            Move::WordRight => move_word_right(doc, focus),
+            Move::Left => move_left(doc, focus, edit),
+            Move::Right => move_right(doc, focus, edit),
+            Move::WordLeft => move_word_left(doc, focus, edit),
+            Move::WordRight => move_word_right(doc, focus, edit),
             Move::BlockStart => Pos::new(focus.block, 0),
             Move::BlockEnd => Pos::new(
                 focus.block,

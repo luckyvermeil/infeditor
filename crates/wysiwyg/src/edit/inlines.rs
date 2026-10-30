@@ -95,8 +95,16 @@ impl Editor {
     }
 
     /// Delete the plain-text range [range). Modifies in place.
-    pub(crate) fn inlines_delete(inl: &mut Vec<Inline>, range: &Range<usize>) {
-        Self::inlines_delete_at(inl, range, 0);
+    /// `editing` is the plain range of the atom whose **source is on screen**
+    /// (see [`crate::reveal`]: a formula at the caret, or an image whose alt is
+    /// selected): inside it a delete takes the covered characters instead of the
+    /// whole atom.
+    pub(crate) fn inlines_delete(
+        inl: &mut Vec<Inline>,
+        range: &Range<usize>,
+        editing: Option<(usize, usize)>,
+    ) {
+        Self::inlines_delete_at(inl, range, 0, editing);
         compact(inl);
     }
 
@@ -106,7 +114,17 @@ impl Editor {
     /// would emit a truncated `$$…$$` (so delete it whole); after a Link is cut in
     /// the middle the URL would hang off the remaining tail (the remaining text is
     /// unlinked instead: structure kept, shell removed).
-    pub(crate) fn inlines_delete_at(inl: &mut Vec<Inline>, range: &Range<usize>, base: usize) {
+    ///
+    /// The exception is the atom under the cursor *while its text is on screen*:
+    /// that is text the user is editing, so the covered characters go and the
+    /// node stays (an emptied source drops the node). `editing` is an absolute
+    /// `(start, end)` range; containers pass it through unchanged.
+    pub(crate) fn inlines_delete_at(
+        inl: &mut Vec<Inline>,
+        range: &Range<usize>,
+        base: usize,
+        editing: Option<(usize, usize)>,
+    ) {
         let mut new: Vec<Inline> = Vec::new();
         let mut cur = base;
         for node in inl.drain(..) {
@@ -118,6 +136,35 @@ impl Editor {
                 // The whole node lies inside the delete range: drop it
             } else {
                 match node {
+                    // An editing formula is text: drop the covered source
+                    // characters, keep the node (dropped once nothing is left).
+                    Inline::Math { src, display } if editing == Some((cur, cur + len)) => {
+                        let (a, b) = clamp_span(
+                            &src,
+                            range.start.saturating_sub(s),
+                            range.end.saturating_sub(s),
+                        );
+                        let mut kept = String::with_capacity(src.len().saturating_sub(b - a));
+                        kept.push_str(&src[..a]);
+                        kept.push_str(&src[b..]);
+                        if !kept.is_empty() {
+                            new.push(Inline::Math { src: kept, display });
+                        }
+                    }
+                    // Same for an image whose alt is on screen: the alt is what
+                    // the user selected, so only those characters go (`![](u)` is
+                    // still a valid image, so an emptied alt keeps the node).
+                    Inline::Image { url, alt } if editing == Some((cur, cur + len)) => {
+                        let (a, b) = clamp_span(
+                            &alt,
+                            range.start.saturating_sub(s),
+                            range.end.saturating_sub(s),
+                        );
+                        let mut kept = String::with_capacity(alt.len().saturating_sub(b - a));
+                        kept.push_str(&alt[..a]);
+                        kept.push_str(&alt[b..]);
+                        new.push(Inline::Image { url, alt: kept });
+                    }
                     // Math/Image are atomic: a partial delete becomes a whole delete (half an `src`
                     // is a leftover shell, and an image node with half an alt is equally
                     // meaningless — on a real machine a backspace turned `![example]` into
@@ -133,25 +180,25 @@ impl Editor {
                             range.start.saturating_sub(s),
                             range.end.saturating_sub(s),
                         );
-                        Self::inlines_delete_at(&mut c, &(s + a..s + b), s);
+                        Self::inlines_delete_at(&mut c, &(s + a..s + b), s, editing);
                         new.extend(c);
                     }
                     // Container: recurse into it and keep the shell (what remains after deleting the
                     // middle is still bold)
                     Inline::Strong(mut c) => {
-                        Self::inlines_delete_at(&mut c, range, s);
+                        Self::inlines_delete_at(&mut c, range, s, editing);
                         if !c.is_empty() {
                             new.push(Inline::Strong(c));
                         }
                     }
                     Inline::Em(mut c) => {
-                        Self::inlines_delete_at(&mut c, range, s);
+                        Self::inlines_delete_at(&mut c, range, s, editing);
                         if !c.is_empty() {
                             new.push(Inline::Em(c));
                         }
                     }
                     Inline::Del(mut c) => {
-                        Self::inlines_delete_at(&mut c, range, s);
+                        Self::inlines_delete_at(&mut c, range, s, editing);
                         if !c.is_empty() {
                             new.push(Inline::Del(c));
                         }
@@ -195,13 +242,36 @@ impl Editor {
     /// Insert text at plain-text offset `off`. When the offset falls inside
     /// Code/Math/Image, those atomic nodes are not broken — the text goes next to
     /// them.
-    pub(crate) fn inlines_insert(inl: &mut Vec<Inline>, off: usize, text: &str) {
+    ///
+    /// `editing` is the plain range of the atom whose **text is on screen** (see
+    /// [`crate::reveal`]: a formula at the caret, or an image whose alt is shown);
+    /// typing strictly inside it edits that text in place instead of splitting the
+    /// atom into two truncated halves.
+    pub(crate) fn inlines_insert(
+        inl: &mut Vec<Inline>,
+        off: usize,
+        text: &str,
+        editing: Option<(usize, usize)>,
+    ) {
         // Math/Image carry no addressable caret position (geom draws such a caret
         // at the atom's front edge), so an interior offset is normalized there
         // first: splitting here produced two half formulas (`$x+$Z$y$`) and, worse,
         // **two images** from one (`![I](u)X![MG](u)`) — one open+save cycle then
         // had an extra image.
-        let off = atom_floor(inl, off);
+        //
+        // The atom whose text is on screen is the exception: the caret the user
+        // sees between two of its characters is a real insertion point.
+        let off = match editing {
+            Some((s, e)) if off > s && off < e => off,
+            _ => atom_floor(inl, off),
+        };
+        // At the atom's **end** the character goes *after* the atom, even while its
+        // source is on screen: that offset is also "the boundary where the following
+        // text starts" — the autoformat flow types `$x$` and keeps typing, and
+        // appending to the source would swallow the rest of the sentence into the
+        // formula. (Backspace at the same offset takes the last source character; the
+        // source view collapses as soon as the caret leaves the atom, so the drawn
+        // caret and the typed character never disagree for longer than one keystroke.)
         let mut cur = 0usize;
         let mut idx_split: Option<(usize, usize)> = None; // (node index, offset inside the node)
         for (i, node) in inl.iter().enumerate() {
@@ -241,6 +311,28 @@ impl Editor {
                 // code"): typing goes straight into the code text; the atomic branch would
                 // demote it to bare Text (losing the code span's meaning).
                 Inline::Code(t) if t.is_empty() => t.push_str(text),
+                // The atom whose text is on screen is text: the character goes into
+                // the LaTeX source / the alt. `local` is `off - cur`, so `cur` (the
+                // node's start) is `off - local` — the node is being edited exactly
+                // when its start is the editing span's start.
+                //
+                // Strictly inside only (`local > 0`): at the atom's **left edge** the
+                // character still belongs to the text before it, which is what makes
+                // "type at the start of a line that begins with a formula" prepend a
+                // paragraph's first characters instead of silently rewriting the
+                // formula (the atomic branch below does exactly that).
+                Inline::Math { src, .. }
+                    if local > 0 && editing == Some((off - local, off - local + src.len())) =>
+                {
+                    let local = floor_boundary(src, local);
+                    src.insert_str(local, text);
+                }
+                Inline::Image { alt, .. }
+                    if local > 0 && editing == Some((off - local, off - local + alt.len())) =>
+                {
+                    let local = floor_boundary(alt, local);
+                    alt.insert_str(local, text);
+                }
                 // Nested container: recurse to insert inside it (keeping the formatting
                 // continuous — typing inside bold still yields bold, matching browser behavior)
                 Inline::Strong(_) | Inline::Em(_) | Inline::Del(_) | Inline::Link { .. } => {
@@ -249,7 +341,14 @@ impl Editor {
                         Inline::Link { inlines: c, .. } => c,
                         _ => unreachable!(),
                     };
-                    Self::inlines_insert(children, local, text);
+                    // The editing atom keeps its identity inside a nested container:
+                    // the absolute range is rebased into the container's coordinates
+                    // (a formula under `**…**` is still the same formula).
+                    let base = off - local;
+                    let inner = editing
+                        .filter(|(s, _)| *s >= base)
+                        .map(|(s, e)| (s - base, e - base));
+                    Self::inlines_insert(children, local, text, inner);
                     compact(children);
                 }
                 // Atomic node: split into [before, Text(new), after]

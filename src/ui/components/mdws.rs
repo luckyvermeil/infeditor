@@ -96,6 +96,11 @@ pub fn seed_from_doc(st: &EditorState) {
     let text = active_text(st);
     let mut ed = WysEditor::new(wysiwyg::parse_doc(&text));
     restore_caret(st, &text, &mut ed);
+    // The source expansion's block-height floors were measured on the **previous**
+    // document; they are indexed by block number, so carrying them over pads blocks of
+    // the new one (a short paragraph under a tall table kept the table's height).
+    // `Editor::set_doc` clears them, but a tab switch replaces the editor wholesale.
+    wysiwyg::render::clear_height_floors();
     *WYS.signal().write() = ed;
     // Bind the session to the document identity, not to its current text: another tab may
     // legitimately hold the same text with a different undo history.
@@ -647,6 +652,23 @@ pub fn drag_tick(st: &mut EditorState) -> bool {
     // the selection grows past the viewport.
     align_status(st);
     true
+}
+
+/// End a WYS pointer drag whose release the component never saw (the pointer left the
+/// window, so the DOM `pointerup` went elsewhere): the pointer-owned source
+/// reveal is dropped, and a one-line selection falls back to typeset exactly as it
+/// does on a normal release.
+///
+/// Returns whether a drag was live. The window-level release handler uses that to
+/// skip the state write for an ordinary click (the WYS press sets `md_drag` on
+/// every press, not only on drags).
+pub fn end_wys_drag() -> bool {
+    let Some(h) = HANDLE.read().as_ref().cloned() else {
+        return false;
+    };
+    let mut editor = WYS.signal();
+    let mut overlays = OVERLAYS.signal();
+    wysiwyg::ui::host_drag_end(h, &mut editor, &mut overlays)
 }
 
 /// Common prefix/suffix lengths (bytes), both falling back to character boundaries of the two
@@ -1399,7 +1421,7 @@ fn set_focus_code_lang(lang: &str) {
 /// position.
 ///
 /// Both are conditional writes (iron rule: only write on change, never self-sustain redraws).
-pub fn overlays_frame(wys: bool) -> bool {
+pub fn overlays_frame(wys: bool, dragging: bool) -> bool {
     // Re-render after host edits (a signal written during the frame phase is seen by this
     // round's poll; see NEEDS_RENDER)
     if NEEDS_RENDER.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -1466,10 +1488,13 @@ pub fn overlays_frame(wys: bool) -> bool {
         }
     }
     let sel = WYS.read().sel;
+    // While a drag is in progress the floating toolbar stays hidden: it sits above the
+    // selection (right under the moving pointer) and would swallow the pointer moves that
+    // extend the drag — the widget owns the drag now (see `wysiwyg::ui` onpointermove).
     let next = mdselbar::step(
         &mdselbar::current(),
         sel,
-        wysiwyg::ui::is_composing(),
+        wysiwyg::ui::is_composing() || dragging,
         root_scroll(),
         sel_start_view(sel),
         std::time::Instant::now(),
@@ -2186,9 +2211,14 @@ pub fn MdWys() -> Element {
     // animations (see the winshell bridge module comments).
     let caret_op = if blink && !caret_phase { 0.0 } else { 1.0 };
     let blink_vars = format!("--wys-caret-op:{caret_op};");
+    // Line wash of the source expansion (a revealed block is tinted so the reader can
+    // see which lines the sweep turned into source): the theme accent at 10%, so it
+    // works on both the light and the dark surface.
+    let tint = mdselbar::rgba(state.read().theme().accent, 0.10);
     let root_style = format!(
         "position:absolute; top:{vtop}px; left:{vx}px; width:{vw}px; height:{vh}px; \
-         background:{bg}; overflow:hidden; --wys-fg:{fg}; --wys-caret:{caret_color}; {blink_vars}"
+         background:{bg}; overflow:hidden; --wys-fg:{fg}; --wys-caret:{caret_color}; \
+         --wys-tint:{tint}; {blink_vars}"
     );
     // Relative images resolve against the document's **containing directory** (same rule as
     // export_html/preview); an unsaved new document has no path → None (alt placeholder, no
@@ -2812,7 +2842,7 @@ mod overlays_frame_tests {
         let _guard = RuntimeGuard::new(vdom.runtime());
         mdhint::set_state(Some(hint_state("smi")));
         assert!(mdhint::open(), "precondition: panel open");
-        overlays_frame(false);
+        overlays_frame(false, false);
         assert!(
             !mdhint::open(),
             "non-wys view must close the candidate panel"
@@ -2823,7 +2853,7 @@ mod overlays_frame_tests {
         );
         // Idempotence: calling again after everything is closed writes nothing (conditional
         // write iron rule)
-        overlays_frame(false);
+        overlays_frame(false, false);
         assert!(!mdhint::open());
     }
 
@@ -2835,7 +2865,7 @@ mod overlays_frame_tests {
         let _guard = RuntimeGuard::new(vdom.runtime());
         assert!(handle().is_none(), "precondition: no handle");
         mdhint::set_state(Some(hint_state("ru")));
-        overlays_frame(true);
+        overlays_frame(true, false);
         // Caret anchor not found → inconsistent with the panel snapshot → close the panel (not
         // left at the wrong position)
         assert!(!mdhint::open(), "lost anchor must close the panel");

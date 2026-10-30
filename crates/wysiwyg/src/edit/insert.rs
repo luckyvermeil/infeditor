@@ -23,6 +23,10 @@ impl Editor {
         }
         self.delete_selection();
         let p = self.sel.focus;
+        // The atom whose text is on screen right now (see [`crate::reveal`]): typing
+        // strictly inside it edits that text (LaTeX source / image alt) instead of
+        // splitting the atom. Taken **before** the mutable borrow of the block below.
+        let editing = self.reveal().editing_span(p.block);
         // Code and HTML (including inside a quote shell) are plain-text shells:
         // take_inlines/set_inlines are no-ops for them, and falling into the fallback
         // branch silently drops characters (apply reports changed, the caret moves
@@ -59,7 +63,7 @@ impl Editor {
         // and the caret that follows it must agree, and a mid-character offset would
         // otherwise be silently floored inside the inline tree.
         let off = floor_boundary(&b_plain(&inl), p.off);
-        Editor::inlines_insert(&mut inl, off, text);
+        Editor::inlines_insert(&mut inl, off, text, editing);
         set_inlines(b, inl);
         let mut np = Pos::new(p.block, off + text.len());
         // ---- Block-level auto-completion ----

@@ -41,6 +41,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use dioxus_elements::input_data::MouseButton;
 use dioxus_native::prelude::*;
 use dioxus_native::NodeHandle;
 
@@ -52,6 +53,10 @@ use crate::render;
 
 /// Triple-click window: the max gap between adjacent clicks.
 const TRIPLE_WINDOW: Duration = Duration::from_millis(600);
+/// Pointer-drag slop: a press that moves less than this is a click, not a drag
+/// (blitz used 2px for its native drag; the value is in CSS px).
+const DRAG_SLOP: f32 = 2.0;
+
 /// Triple-click detection: the max displacement between adjacent clicks (px).
 /// Aligned with touch slop — a fingertip's consecutive taps commonly drift
 /// 3–6px, and 6px sits at the critical edge; mouse clicks are usually 0–2px
@@ -214,50 +219,6 @@ impl Ctx<'_> {
         push_selection(&self.handle, sel);
     }
 
-    /// blitz's native selection → model Sel (read back during a drag select).
-    /// anchor keeps the drag start passed in by the caller (blitz's endpoints
-    /// have no direction semantics), focus = the other end. Returns None when
-    /// there is no selection.
-    fn read_blitz_sel(&self, _g: &Geom, anchor: Pos) -> Option<Sel> {
-        let doc = self.handle.try_doc()?;
-        let ranges = doc.get_text_selection_ranges();
-        if ranges.is_empty() {
-            return None;
-        }
-        let (first_node, s0, _) = ranges[0];
-        let (last_node, _, e1) = ranges[ranges.len() - 1];
-        let bid_of = |doc: &blitz_dom::BaseDocument, nid: blitz_dom::NodeId| -> Option<usize> {
-            let node = doc.get_node(nid)?;
-            let el = node.data.downcast_element()?;
-            let a = el.attrs().iter().find(|a| &*a.name.local == "data-bid")?;
-            a.value.parse().ok()
-        };
-        let b0 = crate::geom::layout_to_plain(&doc, first_node, s0)?;
-        let b1 = crate::geom::layout_to_plain(&doc, last_node, e1)?;
-        let bid0 = bid_of(&doc, first_node);
-        let bid1 = bid_of(&doc, last_node);
-        drop(doc);
-        let p0 = Pos::new(bid0?, b0);
-        let p1 = Pos::new(bid1?, b1);
-        // The moving end is whichever endpoint is farther from the drag start.
-        // The anchor can be a position blitz cannot express (an empty block, a
-        // formula's virtual bytes, the "click past the end" fallback), in which
-        // case *neither* endpoint equals it and the old "if p0 == anchor" test
-        // picked the wrong end — the model selection then covered a different
-        // range than the on-screen highlight (copy/cut read the model one).
-        let key = |p: Pos| (p.block, p.off);
-        let focus = if key(anchor) <= key(p0) {
-            p1
-        } else if key(anchor) >= key(p1) {
-            p0
-        } else if p0 == anchor {
-            p1
-        } else {
-            p0
-        };
-        Some(Sel { anchor, focus })
-    }
-
     /// The unified entry point for applying a command: write the model →
     /// recompute the caret CSS → (document unchanged) push the selection back
     /// immediately; document changed → restore the caret/selection one frame
@@ -272,7 +233,12 @@ impl Ctx<'_> {
         // **after** apply, so it always equaled sel_now, `sel_now != sel_before`
         // was forever false, and the selection push-back (apply_sel_to_blitz)
         // never ran.
-        let sel_before = self.editor.read().sel;
+        // The source expansion rides on the selection, so its value before the
+        // command decides whether the **fragments** change (see `dom_changed`).
+        let (sel_before, reveal_before) = {
+            let ed = self.editor.read();
+            (ed.sel, ed.reveal())
+        };
         // The len statistics are two full-document plain_text traversals, done
         // only when logging is on: `format!` arguments are evaluated before
         // wys_log's internal check — on a 500-block document that is 2×500 heap
@@ -288,8 +254,23 @@ impl Ctx<'_> {
                 total_plain_len(&self.editor.read().doc)
             ));
         }
-        let sel_now = self.editor.read().sel;
+        let (sel_now, reveal_now) = {
+            let ed = self.editor.read();
+            (ed.sel, ed.reveal())
+        };
         let g = self.geom();
+        // A selection that starts expanding right now (Ctrl+A, Shift+arrows) needs the
+        // typeset heights too — the DOM still holds them for this frame.
+        if reveal_before.is_empty() && !reveal_now.is_empty() {
+            render::set_height_floors(g.block_heights(&self.editor.read().doc));
+        } else if !reveal_before.is_empty() && reveal_now.is_empty() {
+            // Nothing is expanded any more. The measurement describes the typeset
+            // shapes of *one* moment; keeping it would outlive the document it was
+            // taken from (a tab switch re-seeds the editor without going through
+            // `set_doc`) and inflate the boxes of a later sweep. Re-taken on the next
+            // expansion — the first press or Ctrl+A.
+            render::clear_height_floors();
+        }
         self.sync_overlays(&g);
         // Pure selection/move commands do not touch the document: the old DOM
         // is still valid, push back immediately.
@@ -302,6 +283,12 @@ impl Ctx<'_> {
             cmd,
             Cmd::Move(_) | Cmd::MoveExtend(_) | Cmd::SelectAll | Cmd::SelectWord | Cmd::SelectBlock
         );
+        // A pure caret move can still change the **source expansion** (the caret
+        // stepping onto a formula's edge expands it, stepping away collapses it) —
+        // that rebuilds the fragments exactly like a document change, so the
+        // caret/selection must be restored after the rebuild, not pushed onto
+        // nodes that are about to be destroyed.
+        let dom_changed = !doc_unchanged || reveal_now != reveal_before;
         // Mouse edits (checking a task box, etc.) only happen inside this
         // component: notify the host to write back and mark dirty, otherwise the
         // change only lives in the wys model and gets overwritten by the piece
@@ -311,15 +298,44 @@ impl Ctx<'_> {
                 cb.call(());
             }
         }
-        if doc_unchanged {
+        if dom_changed {
+            self.deferred_sync(sel_now);
+        } else {
             if sel_now != sel_before {
                 self.apply_sel_to_blitz(sel_now);
             }
             caret_into_view(&self.handle, sel_now.focus);
-        } else {
-            self.deferred_sync(sel_now);
         }
         changed
+    }
+
+    /// One step of a pointer drag: move the moving end of the selection to `p`.
+    ///
+    /// The **same** rule as a keyboard extend: when the sweep expands or collapses
+    /// a block the fragment is rebuilt, so the highlight has to be restored a frame
+    /// later (pushing it now would draw on nodes that are about to be destroyed).
+    /// Called per pointer move, so the source expansion follows the pointer.
+    fn drag_to(&mut self, p: Pos) {
+        let reveal_before = self.editor.read().reveal();
+        {
+            let mut ed = self.editor.write();
+            // From this move on the pointer owns the block under its row,
+            // including blank starts/ends and the right margin.
+            ed.dragging = true;
+            ed.sel.focus = p;
+            ed.h_pos = None; // a drag ends the ↑/↓ column chain
+        }
+        let sel = self.editor.read().sel;
+        let g = self.geom();
+        self.sync_overlays(&g);
+        if self.editor.read().reveal() != reveal_before {
+            self.deferred_sync(sel);
+        } else {
+            self.apply_sel_to_blitz(sel);
+        }
+        if let Some(cb) = self.on_caret.as_ref() {
+            cb.call(());
+        }
     }
 
     /// Deferred sync after a document change: wait one frame for the DOM rebuild
@@ -468,6 +484,15 @@ static NEEDS_RESYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// caller's request_redraw).
 static RESYNC_TRIES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// How many frames the deferred restore may spend waiting for the layout.
+///
+/// Three frames were enough for a one-block edit; the source expansion changes
+/// **many** blocks at once (a Ctrl+A expands the whole document, every fence, pipe
+/// and delimiter adds nodes), so the fragment rebuild + re-layout needs a few more
+/// frames or the caret/delimiter restore gives up and the caret stays where the
+/// previous layout put it.
+const RESYNC_CAP: u8 = 8;
+
 /// The host frame hook: finishes "push the caret/selection back after a
 /// document change + scroll it into view". Zero cost when nothing is pending
 /// (one atomic). Called in `RedrawRequested`.
@@ -571,7 +596,7 @@ pub fn host_flush_resync(
         next.caret = Some(r);
         RESYNC_TRIES.store(0, std::sync::atomic::Ordering::Relaxed);
         true
-    } else if RESYNC_TRIES.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+    } else if RESYNC_TRIES.load(std::sync::atomic::Ordering::Relaxed) < RESYNC_CAP {
         RESYNC_TRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         NEEDS_RESYNC.store(true, std::sync::atomic::Ordering::Relaxed);
         false
@@ -652,7 +677,11 @@ fn focus_layout_ready(handle: &NodeHandle, block: usize) -> bool {
 /// Model Sel → the caret overlay rect (pure function): document coordinates
 /// minus the root origin.
 fn caret_overlay(g: &Geom, sel: Sel) -> Option<OverlayRect> {
-    let r = g.caret_rect(sel.focus)?;
+    // The focus caret follows the **selection's** edge mapping: a range ending at
+    // a block's last plain byte paints the trailing source markers, and the caret
+    // marks the far side of them (`| 丙 | 丁 |` → after the last `|`). A collapsed
+    // caret keeps the plain mapping (inside the markers).
+    let r = g.caret_rect_sel(sel)?;
     let (ox, oy) = g.root_origin()?;
     Some(OverlayRect {
         x: r.x - ox,
@@ -697,10 +726,15 @@ fn push_selection(handle: &NodeHandle, sel: Sel) -> bool {
     ) else {
         return false;
     };
-    let (Some(s), Some(e)) = (
-        crate::geom::plain_to_layout(&doc, sn, start.off),
-        crate::geom::plain_to_layout(&doc, en, end.off),
-    ) else {
+    // The painted layout range: a **range** reaching a block's first/last plain
+    // byte also covers the virtual source markers at that edge (`| `, `**`, a
+    // closing fence) — the copy writes them, so the highlight must show them. The
+    // caret mapping alone left the edge markers permanently unhighlighted (a
+    // table ending the document: "select past it" stopped in front of the
+    // trailing `|`). See [`crate::geom::selection_layout_span`].
+    let Some((s, e)) =
+        crate::geom::selection_layout_span(&doc, sn, en, start.off, end.off, sel.collapsed())
+    else {
         return false;
     };
     drop(doc);
@@ -792,8 +826,20 @@ pub fn Wysiwyg(
     // safe_image_url as the preview).
     // Formulas render at the current body font size (fs is configurable; a
     // fixed 16 would be inconsistent with 14px body text)
-    let frags =
-        render::region_fragments_sized(&editor.read().doc, &fg, img_base.as_deref(), fs as f32);
+    //
+    // The source expansion (`reveal`) is resolved **once** here: the selection
+    // shows its Markdown delimiters and the formula at the caret shows its LaTeX,
+    // so the fragment strings — and therefore what blitz parses — carry them.
+    let frags = {
+        let ed = editor.read();
+        render::region_fragments_revealed(
+            &ed.doc,
+            &fg,
+            img_base.as_deref(),
+            fs as f32,
+            &ed.reveal(),
+        )
+    };
 
     rsx! {
         style { {render::SHELL_CSS} }
@@ -907,7 +953,11 @@ pub fn Wysiwyg(
                     g.empty_block_at(x, y, &ed.doc)
                         .map(|bid| Pos::new(bid, 0))
                         .or_else(|| g.math_at(x, y, &ed.doc))
-                        .or_else(|| g.pos_at(x, y, &ed.doc))
+                        // The same row-based mapping the drag uses: a click in the
+                        // blank margin must land on the line under the pointer, not
+                        // on whatever text happens to be nearest in 2D (which drifts
+                        // as blocks change shape).
+                        .or_else(|| g.drag_pos_at(x, y, &ed.doc))
                         .unwrap_or_else(|| {
                             let last = ed.doc.blocks.len().saturating_sub(1);
                             let off = ed
@@ -948,7 +998,24 @@ pub fn Wysiwyg(
                     }
                 }
                 {
+                    // Record the typeset heights **before** the press collapses the
+                    // selection and the expansion changes the shapes: the drag has to
+                    // keep every expanded block's box, otherwise the document reflows
+                    // under the pointer and the selection end jumps.
+                    //
+                    // Measured only while **nothing** is expanded: with a selection
+                    // still active the DOM holds the *source* heights of the swept
+                    // blocks, and remembering those as floors would inflate the boxes
+                    // of the next sweep (they are also the only heights the previous
+                    // expansion was measured against).
+                    {
+                        let ed = ctx.editor.read();
+                        if ed.reveal().is_empty() {
+                            render::set_height_floors(g.block_heights(&ed.doc));
+                        }
+                    }
                     let mut ed = ctx.editor.write();
+                    ed.dragging = false;
                     ed.sel = Sel::caret(p);
                     ed.h_pos = None; // A click rebuilds the vertical column memory
                 }
@@ -966,9 +1033,40 @@ pub fn Wysiwyg(
                 if let Some(cb) = ctx.on_caret.as_ref() {
                     cb.call(());
                 }
-                // Drag selection is taken over by blitz native (user-select
-                // defaults to Auto); the drag start = the caret just set, read
-                // back on pointerup.
+                // The drag itself is ours (see `onpointermove`): blitz's native
+                // drag selection is switched off (`user-select: none`), so the
+                // fragments may be rebuilt while the selection grows — that is what
+                // makes the source expansion follow the pointer instead of waiting
+                // for the release.
+            },
+            onpointermove: move |evt: PointerEvent| {
+                // Extend the selection while the button is held. Every move is mapped
+                // through `pos_at` against the *current* layout, so a block that
+                // expands under the pointer cannot leave a dangling anchor behind.
+                if !evt.data.held_buttons().contains(MouseButton::Primary) {
+                    return;
+                }
+                let (_, px, py, _) = *clicks.read();
+                let c = evt.data.client_coordinates();
+                let (x, y) = (c.x as f32, c.y as f32);
+                // A plain click's tremor must not select a character (blitz's own
+                // drag used a 2px slop).
+                if (x - px).powi(2) + (y - py).powi(2) < DRAG_SLOP * DRAG_SLOP {
+                    return;
+                }
+                let Some(h) = handle_sig.read().as_ref().cloned() else { return };
+                let mut ctx = Ctx { editor: &mut editor, overlays: &mut overlays, handle: h, on_edit, on_caret, grab };
+                let p = {
+                    let ed = ctx.editor.read();
+                    let g = Geom::new(ctx.handle.clone());
+                    // Row-based mapping, not "nearest text": the source expansion
+                    // changes a block's width under the pointer, and a nearest-text
+                    // answer would flip between two blocks on every move (a table
+                    // flickering between typeset and source).
+                    g.drag_pos_at(x, y, &ed.doc)
+                };
+                let Some(p) = p else { return };
+                ctx.drag_to(p);
             },
             onpointerup: move |_evt: PointerEvent| {
                 if let Some(cb) = on_drag.as_ref() {
@@ -977,18 +1075,19 @@ pub fn Wysiwyg(
                 let Some(h) = handle_sig.read().as_ref().cloned() else { return };
                 let g = Geom::new(h.clone());
                 let mut ctx = Ctx { editor: &mut editor, overlays: &mut overlays, handle: h, on_edit, on_caret, grab };
-                let anchor = ctx.editor.read().sel.anchor;
-                if let Some(sel) = ctx.read_blitz_sel(&g, anchor) {
-                    if !sel.collapsed() {
-                        let mut ed = ctx.editor.write();
-                        ed.sel = sel;
-                        ed.h_pos = None; // drag select ended, vertical column memory invalid
-                        drop(ed);
-                        ctx.sync_overlays(&g);
-                        if let Some(cb) = ctx.on_caret.as_ref() {
-                            cb.call(());
-                        }
-                    }
+                // The selection is already the model's (we own the drag); release
+                // ends the pointer-owned reveal, so a one-line selection falls
+                // back to the ordinary typeset rule.
+                let reveal_before = ctx.editor.read().reveal();
+                ctx.editor.write().dragging = false;
+                let sel = ctx.editor.read().sel;
+                let reveal_after = ctx.editor.read().reveal();
+                ctx.sync_overlays(&g);
+                if reveal_before != reveal_after {
+                    ctx.deferred_sync(sel);
+                }
+                if let Some(cb) = ctx.on_caret.as_ref() {
+                    cb.call(());
                 }
             },
             ondoubleclick: move |_evt: MouseEvent| {
@@ -1300,6 +1399,18 @@ fn handle_keydown(
 /// landing in an empty block (no lines, all geometry queries None) the old
 /// value is kept — continuing to press ↑/↓ still uses the original column.
 fn move_visual_cmd(ctx: &mut Ctx<'_>, up: bool, extend: bool) {
+    // ↑/↓ can step onto (or off) a formula, which expands/collapses its source and
+    // rebuilds that block: the caret and the selection then have to be restored
+    // after the rebuild instead of being pushed onto the old nodes.
+    let reveal_before = ctx.editor.read().reveal();
+    move_visual_inner(ctx, up, extend);
+    let sel = ctx.editor.read().sel;
+    if ctx.editor.read().reveal() != reveal_before {
+        ctx.deferred_sync(sel);
+    }
+}
+
+fn move_visual_inner(ctx: &mut Ctx<'_>, up: bool, extend: bool) {
     let p = ctx.editor.read().sel.focus;
     let saved = ctx.editor.read().h_pos;
     // ↑/↓ are hot keys; the old implementation cloned the whole Doc (deep
@@ -1517,6 +1628,9 @@ pub fn host_goto_block(
         on_caret: None,
         grab: false,
     };
+    // Landing at the start of a block may put the caret next to a formula and
+    // expand it: the block is rebuilt, so restore the caret afterwards.
+    let reveal_before = ctx.editor.read().reveal();
     {
         let mut ed = ctx.editor.write();
         ed.sel = Sel::caret(target);
@@ -1527,6 +1641,9 @@ pub fn host_goto_block(
     let sel = ctx.editor.read().sel;
     ctx.apply_sel_to_blitz(sel);
     caret_into_view(&ctx.handle, target);
+    if ctx.editor.read().reveal() != reveal_before {
+        ctx.deferred_sync(sel);
+    }
     true
 }
 
@@ -1558,10 +1675,11 @@ pub fn host_scroll_by(handle: Rc<NodeHandle>, dy: f64) -> bool {
 /// px, already clamped into the content box by the caller).
 ///
 /// The anchor — the press position — is left alone: this is the extension half
-/// of a drag, and the model `sel` is the single source of truth (the host reads
-/// blitz's selection back only on release; see the component's `onpointerup`).
-/// The whole kernel tail runs (sync → push), so the caret overlay and blitz's
-/// native highlight both follow.
+/// of a drag, and the model `sel` is the single source of truth (blitz's native
+/// drag is switched off with `user-select: none`, so there is no second
+/// selection to read back). The whole kernel tail runs (sync → push), so the
+/// caret overlay and the on-screen highlight both follow — deferred by one frame
+/// when the sweep changed the source expansion, because that rebuilds the block.
 pub fn host_drag_extend(
     handle: Rc<NodeHandle>,
     editor: &mut Signal<Editor>,
@@ -1580,16 +1698,72 @@ pub fn host_drag_extend(
     let p = {
         let ed = ctx.editor.read();
         let g = Geom::new(ctx.handle.clone());
-        match g.pos_at(x, y, &ed.doc) {
+        // Same mapping as the component's drag (see `Geom::drag_pos_at`).
+        match g.drag_pos_at(x, y, &ed.doc) {
             Some(p) => p,
             None => return false,
         }
     };
-    ctx.editor.write().sel.focus = p;
+    let reveal_before = ctx.editor.read().reveal();
+    let moved = {
+        let mut ed = ctx.editor.write();
+        ed.dragging = true;
+        let moved = ed.sel.focus != p;
+        ed.sel.focus = p;
+        ed.h_pos = None;
+        moved
+    };
     let g = ctx.geom();
     ctx.sync_overlays(&g);
     let sel = ctx.editor.read().sel;
-    ctx.apply_sel_to_blitz(sel);
+    let reveal_changed = ctx.editor.read().reveal() != reveal_before;
+    if reveal_changed {
+        // The sweep expanded a block: its nodes are about to be rebuilt, so the
+        // highlight is restored after the rebuild instead of onto dead nodes.
+        ctx.deferred_sync(sel);
+    } else {
+        ctx.apply_sel_to_blitz(sel);
+    }
+    moved || reveal_changed
+}
+
+/// Host path: the window-level primary button was released outside the
+/// component. Ends the pointer-owned reveal exactly like `onpointerup`.
+///
+/// Returns whether a drag was actually live (a press that never moved past the
+/// slop is not a drag). The caller uses the answer to decide whether the release
+/// deserves a state write at all — an ordinary click must not mark the app dirty.
+pub fn host_drag_end(
+    handle: Rc<NodeHandle>,
+    editor: &mut Signal<Editor>,
+    overlays: &mut Signal<Overlays>,
+) -> bool {
+    let was_dragging = editor.read().dragging;
+    if !was_dragging {
+        return false;
+    }
+    // Read **before** the flag drops: `Reveal` treats a pointer-owned selection
+    // differently from a keyboard one, so the old value only exists while
+    // `dragging` is still set.
+    let reveal_before = editor.read().reveal();
+    editor.write().dragging = false;
+    let sel = editor.read().sel;
+    let reveal_changed = editor.read().reveal() != reveal_before;
+    let mut ctx = Ctx {
+        editor,
+        overlays,
+        handle,
+        on_edit: None,
+        on_caret: None,
+        grab: false,
+    };
+    let g = ctx.geom();
+    ctx.sync_overlays(&g);
+    if reveal_changed {
+        ctx.deferred_sync(sel);
+    } else {
+        ctx.apply_sel_to_blitz(sel);
+    }
     true
 }
 

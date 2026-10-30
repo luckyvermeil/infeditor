@@ -175,13 +175,22 @@ pub fn reset() {
 /// `#rrggbb` → `rgba(r,g,b,0.92)` (the bar's translucent background); returns the input
 /// unchanged when parsing fails (an opaque fallback so the text is at least legible).
 fn translucent(color: &str) -> String {
+    rgba(color, 0.92)
+}
+
+/// `#rrggbb` at `alpha` (0..1) → `rgba(r,g,b,alpha)`. Anything that is not a plain
+/// hex color is returned unchanged (an opaque band beats no band at all).
+///
+/// Shared by the toolbar's translucent background and the source expansion's line
+/// wash (`--wys-tint`, see `mdws`), so both follow the theme's accent.
+pub(crate) fn rgba(color: &str, alpha: f32) -> String {
     let hex = color.strip_prefix('#').unwrap_or("");
     if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return color.to_string();
     }
     let n = |a: &str| u8::from_str_radix(a, 16).unwrap_or(0);
     format!(
-        "rgba({},{},{},0.92)",
+        "rgba({},{},{},{alpha})",
         n(&hex[0..2]),
         n(&hex[2..4]),
         n(&hex[4..6])
@@ -349,6 +358,13 @@ mod tests {
         assert_eq!(bar_pos((5.0, 4.0)), (5.0, 0.0));
         // x never goes negative
         assert_eq!(bar_pos((-3.0, 100.0)).0, 0.0);
+    }
+
+    #[test]
+    fn rgba_parses_hex_only() {
+        assert_eq!(rgba("#112233", 0.1), "rgba(17,34,51,0.1)");
+        assert_eq!(rgba("rgb(1,2,3)", 0.1), "rgb(1,2,3)");
+        assert_eq!(rgba("#12345", 0.1), "#12345");
     }
 
     #[test]

@@ -46,7 +46,7 @@ use dioxus_native::NodeHandle;
 use parley::{Affinity, BreakReason, Cursor};
 
 use crate::dom_index::attr_usize;
-use crate::model::{Block, Doc, Pos};
+use crate::model::{Block, Doc, Pos, Sel};
 
 /// Caret rect (document content space, CSS px).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -138,6 +138,121 @@ impl Geom {
         nearest_block_at(&doc, model, self.handle.node_id(), x, y).map(|bid| Pos::new(bid, 0))
     }
 
+    /// Every block's current **content height**, indexed by block number (0 for a
+    /// block the DOM does not know). Measured just before the source expansion
+    /// changes the shapes, see `render::set_height_floors`.
+    pub fn block_heights(&self, model: &Doc) -> Vec<f32> {
+        let mut out = vec![0.0; model.blocks.len()];
+        let Some(doc) = self.handle.try_doc() else {
+            return out;
+        };
+        let container = fragment_container(&doc, self.handle.node_id());
+        crate::dom_index::with_index(&doc, container, |idx| {
+            for (nid, bid) in idx.order() {
+                if let Some(&(_, _, _, h)) = bid_content_rect(&doc, nid).as_ref() {
+                    if let Some(slot) = out.get_mut(bid) {
+                        *slot = h;
+                    }
+                }
+            }
+        });
+        out
+    }
+
+    /// Drag-time mapping: the block under the pointer's **row**, then the offset
+    /// inside it — never "the text nearest to this point".
+    ///
+    /// [`Geom::pos_at`] answers "which text is closest", and that answer flips when
+    /// the **source expansion** changes a block's shape: dragging into the blank
+    /// area beside a table alternated between the table's cell and the paragraph
+    /// above (the bordered table is wide, the source table is narrow), so the table
+    /// flickered between typeset and source on every pointer move. Here the block is
+    /// chosen by the pointer's vertical band (ties resolved by horizontal distance,
+    /// so a table row's *last* cell wins), and a point past that block's right edge
+    /// means "end of the block" — the same answer in both shapes, so the sweep can
+    /// not oscillate.
+    ///
+    /// A table is one unit at its **outer edges** (see [`table_edge_pos`]): a point
+    /// past the top/bottom of the table belongs to the table as a whole — its first
+    /// cell's start / last cell's end — whatever column the pointer is over. The
+    /// per-cell band would otherwise stop the sweep at the cell under the pointer's
+    /// x, and a table that ends the document (no block below to reach) could not be
+    /// selected past that cell: the last character was unreachable.
+    pub fn drag_pos_at(&self, x: f32, y: f32, model: &Doc) -> Option<Pos> {
+        let doc = self.handle.try_doc()?;
+        let (dx, dy) = client_to_content(&doc, self.handle.node_id(), x, y);
+        let container = fragment_container(&doc, self.handle.node_id());
+        // Candidates: caret-addressable blocks, keyed by (vertical distance,
+        // horizontal distance) — containment on both axes wins over "near in y".
+        let hit = crate::dom_index::with_index(&doc, container, |idx| {
+            let mut best: Option<DragHit> = None;
+            for (nid, bid) in idx.order() {
+                // `caret_addressable` also filters Code blocks (they are reached
+                // through the text hit instead of the empty-block fallback), but a
+                // drag over a code block must extend the selection: only a rule,
+                // which has no text at all, is skipped here.
+                let Some(b) = model.blocks.get(bid) else {
+                    continue;
+                };
+                if matches!(b.core(), Block::Hr) {
+                    continue;
+                }
+                let Some((x0, y0, w, h)) = bid_content_rect(&doc, nid) else {
+                    continue;
+                };
+                let ddy = (y0 - dy).max(0.0).max(dy - (y0 + h));
+                let ddx = (x0 - dx).max(0.0).max(dx - (x0 + w));
+                if best.is_none_or(|(by, bx, ..)| (ddy, ddx) < (by, bx)) {
+                    best = Some((ddy, ddx, bid, nid, x0, y0, x0 + w, y0 + h));
+                }
+            }
+            best
+        });
+        let (_, _, bid, nid, left, top, right, bottom) = hit?;
+        // Past the table's top/bottom the table wins as a whole — checked before
+        // `pos_at`, which answers "the text nearest the point" and would stop at the
+        // cell under the pointer's column (a mid-table position).
+        if let Some((t_top, t_bottom, first, last)) = table_of(&doc, model, nid, bid) {
+            let in_last_row = model
+                .blocks
+                .get(bid)
+                .zip(model.blocks.get(last))
+                .is_some_and(|(at, end)| same_row(at, end));
+            if let Some(p) = table_edge_pos(
+                model,
+                first,
+                last,
+                (t_top, t_bottom),
+                bottom,
+                in_last_row,
+                dy,
+            ) {
+                return Some(p);
+            }
+        }
+        // A point inside the block: the exact character under the pointer (this is
+        // the normal "dragging over text" case, unchanged).
+        if let Some(p) = self.pos_at(x, y, model) {
+            if p.block == bid {
+                return Some(p);
+            }
+        }
+        // Otherwise clamp to the block: above it → its start, below it → its end,
+        // past its right edge → its end, before it → its start; a point inside the
+        // box but on blank space (cell padding) takes the nearer end by x.
+        let len = model.blocks.get(bid)?.plain_len();
+        let off = if dy < top || dx < left {
+            0
+        } else if dy > bottom || dx >= (left + right) / 2.0 {
+            // Below the block, past its right edge, or inside it past the halfway
+            // point: the end.
+            len
+        } else {
+            0
+        };
+        Some(Pos::new(bid, off))
+    }
+
     /// Screen point → empty-text-block hit (returns the block number). An empty
     /// paragraph / list item / table cell has no text node, so
     /// `find_text_position` (vendor patch four's nearest_text_descendant
@@ -216,6 +331,22 @@ impl Geom {
                     let Some(&(start, end)) = spans.get(ordinal) else {
                         continue;
                     };
+                    // A formula whose **source is shown** is ordinary text: the
+                    // click must land on the character under the pointer, not snap
+                    // to the formula's edges (that is the whole point of expanding
+                    // it). Its `<span data-math data-math-src>` carries real text,
+                    // so `pos_at` handles it.
+                    if doc
+                        .get_node(nid)
+                        .and_then(|n| {
+                            n.data
+                                .downcast_element()
+                                .map(|el| attr_str(el, "data-math-src").is_some())
+                        })
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
                     let Some((x0, y0, w, h)) = math_rect(&doc, nid) else {
                         continue;
                     };
@@ -292,6 +423,32 @@ impl Geom {
     /// caret is `scale` times larger than the text (demo scale=1 can never
     /// expose this).
     pub fn caret_rect(&self, pos: Pos) -> Option<CaretRect> {
+        self.caret_rect_edge(pos, CaretEdge::Plain)
+    }
+
+    /// The caret rect of a **selection's focus**.
+    ///
+    /// A range paints the block's layout edge when it reaches the block's
+    /// first/last plain byte (see [`selection_layout_span`]) — the virtual source
+    /// markers at that edge are part of the copied text. The focus caret must sit
+    /// on the **same** edge: a selection ending at a table's last cell showed the
+    /// highlight past the trailing ` |` while the caret bar stopped in front of
+    /// it, so the caret "could not reach the far side of the last character".
+    /// A collapsed caret keeps the plain mapping (inside the markers — the
+    /// `**bold|**` / `$x|$` convention).
+    pub fn caret_rect_sel(&self, sel: Sel) -> Option<CaretRect> {
+        let edge = {
+            let doc = self.handle.try_doc()?;
+            let end_len = self
+                .block_node(&doc, sel.range().1.block)
+                .map(|nid| block_plain_len(&doc, nid))
+                .unwrap_or(usize::MAX);
+            focus_caret_edge(sel, end_len)
+        };
+        self.caret_rect_edge(sel.focus, edge)
+    }
+
+    fn caret_rect_edge(&self, pos: Pos, edge: CaretEdge) -> Option<CaretRect> {
         let doc = self.handle.try_doc()?;
         let nid = self.block_node(&doc, pos.block)?;
         let node = doc.get_node(nid)?;
@@ -308,7 +465,7 @@ impl Geom {
         // **negative offset** (observed y=-40), so the computed caret would land
         // on the previous line. A zero-line layout always goes through geometric
         // synthesis ([`inline_caret`] returns None).
-        let Some(c) = inline_caret(&doc, nid, el, pos.off, doc.viewport().scale()) else {
+        let Some(c) = inline_caret(&doc, nid, el, pos.off, doc.viewport().scale(), edge) else {
             let container = fragment_container(&doc, self.handle.node_id());
             return empty_block_caret(&doc, container, nid, pos.block, pos.off);
         };
@@ -334,7 +491,7 @@ impl Geom {
         let el = node.data.downcast_element()?;
         let (bx, by) = doc_position(&doc, nid);
         let lay = node.unrounded_layout();
-        let Some(c) = inline_caret(&doc, nid, el, pos.off, scale) else {
+        let Some(c) = inline_caret(&doc, nid, el, pos.off, scale, CaretEdge::Plain) else {
             return Some(format!(
                 "scale={scale:.4} bid={} EMPTY-FALLBACK blkpos=({bx:.1},{by:.1}) \
                  box={:.1}x{:.1} pad=({:.1},{:.1}) border=({:.1},{:.1})",
@@ -703,11 +860,141 @@ fn content_box(doc: &BaseDocument, nid: blitz_dom::NodeId) -> Option<(f32, f32, 
     ))
 }
 
+/// A candidate for [`Geom::drag_pos_at`]: `(row gap, column gap, block number,
+/// DOM node, content x0, y0, x1, y1)` — the gaps are the ordering key.
+type DragHit = (f32, f32, usize, blitz_dom::NodeId, f32, f32, f32, f32);
+
+/// The **layout byte range** a model selection paints between two block nodes.
+///
+/// `plain_to_layout` is the caret mapping: a plain `0` is drawn *inside* the
+/// opening source marker (`**|bold**`) and a plain `len` sits *before* the
+/// closing one (`**bold|**`). For a **range** those two edges are wrong: the
+/// markers are part of the copied text (`selected_markdown` writes them), so a
+/// selection that reaches a block's first/last plain byte must paint the block's
+/// layout edge — otherwise the marker at the edge is highlighted by nothing:
+/// with a table ending the document, "select past it" stopped in front of the
+/// trailing `|`, its last visible character.
+///
+/// A **collapsed** selection keeps the plain mapping — a caret has to stay
+/// inside the markers, and widening it would paint a sliver at the caret.
+pub(crate) fn selection_layout_span(
+    doc: &BaseDocument,
+    sn: blitz_dom::NodeId,
+    en: blitz_dom::NodeId,
+    start: usize,
+    end: usize,
+    collapsed: bool,
+) -> Option<(usize, usize)> {
+    if collapsed {
+        return Some((
+            plain_to_layout(doc, sn, start)?,
+            plain_to_layout(doc, en, end)?,
+        ));
+    }
+    let s = if start == 0 {
+        0
+    } else {
+        plain_to_layout(doc, sn, start)?
+    };
+    let e = if end >= block_plain_len(doc, en) {
+        // `usize::MAX` = the block's total layout length, i.e. past the closing
+        // markers (see `plain_to_layout`).
+        plain_to_layout(doc, en, usize::MAX)?
+    } else {
+        plain_to_layout(doc, en, end)?
+    };
+    Some((s, e))
+}
+
 /// A block element's content-box rect; returns None when the box is not laid
 /// out yet (width/height ≤ 0) — hit testing would rather miss than
 /// mis-hit.
 fn bid_content_rect(doc: &BaseDocument, nid: blitz_dom::NodeId) -> Option<(f32, f32, f32, f32)> {
     content_box(doc, nid).filter(|&(_, _, w, h)| w > 0.0 && h > 0.0)
+}
+
+/// The `<table>` ancestor of a node, with its content box (the table's box). A
+/// drag past this box belongs to the table as a whole — see [`table_edge_pos`].
+/// `None` when the node is not inside a laid-out table.
+fn table_box(doc: &BaseDocument, mut nid: blitz_dom::NodeId) -> Option<(f32, f32, f32, f32)> {
+    for _ in 0..8 {
+        let node = doc.get_node(nid)?;
+        if let Some(el) = node.data.downcast_element() {
+            if &*el.name.local == "table" {
+                return content_box(doc, nid).filter(|&(_, _, w, h)| w > 0.0 && h > 0.0);
+            }
+        }
+        nid = node.parent?;
+    }
+    None
+}
+
+/// The table a cell belongs to: its vertical band `(top, bottom)` plus the block
+/// numbers of its first and last cell. `None` for a block that is not a cell (or
+/// a cell with no laid-out `<table>` ancestor — an ungrouped `Td` rendered as a
+/// paragraph).
+fn table_of(
+    doc: &BaseDocument,
+    model: &Doc,
+    nid: blitz_dom::NodeId,
+    bid: usize,
+) -> Option<(f32, f32, usize, usize)> {
+    let seq = model.blocks.get(bid)?.table_seq()?;
+    let (_, y, _, h) = table_box(doc, nid)?;
+    // A table's cells are contiguous in the model (parse/emit order), so the ends
+    // are the run of blocks sharing the `table_seq`.
+    let mut first = bid;
+    while first > 0 && model.blocks.get(first - 1).and_then(Block::table_seq) == Some(seq) {
+        first -= 1;
+    }
+    let mut last = bid;
+    while last + 1 < model.blocks.len()
+        && model.blocks.get(last + 1).and_then(Block::table_seq) == Some(seq)
+    {
+        last += 1;
+    }
+    Some((y, y + h, first, last))
+}
+
+/// Whether two blocks are cells of the **same table row**.
+fn same_row(a: &Block, b: &Block) -> bool {
+    match (a.core(), b.core()) {
+        (Block::Td { row: ra, .. }, Block::Td { row: rb, .. }) => ra == rb,
+        _ => false,
+    }
+}
+
+/// The model position a drag takes when the pointer is **outside the table's
+/// rows**: past its top, past its bottom/right (the drag left the block below the
+/// last row), or below the last row's content box (a cell's bottom padding, the
+/// source form's delimiter row).
+///
+/// A table is one unit for the reader, so the table's edge wins over the cell
+/// under the pointer's column: the per-cell band used to stop the sweep in the
+/// cell whose x the pointer was over, and a table that **ends the document** (no
+/// block below ever being reached) could not be selected past that cell — its
+/// last character was unreachable. Symmetrically a drag above a leading table now
+/// reaches its first cell's start.
+///
+/// `None` = the pointer is inside the table's rows; the ordinary per-cell mapping
+/// applies (the cell under the pointer, its nearer end by x).
+fn table_edge_pos(
+    model: &Doc,
+    first: usize,
+    last: usize,
+    bounds: (f32, f32),
+    row_bottom: f32,
+    in_last_row: bool,
+    dy: f32,
+) -> Option<Pos> {
+    let (top, bottom) = bounds;
+    if dy < top {
+        return Some(Pos::new(first, 0));
+    }
+    if dy > bottom || (in_last_row && dy > row_bottom) {
+        return Some(Pos::new(last, model.blocks.get(last)?.plain_len()));
+    }
+    None
 }
 
 /// The nearest caret-addressable block to a point (the geometric fallback when
@@ -828,12 +1115,49 @@ struct InlineCaret {
 /// are CSS px — coordinates derived from parley must be divided back by the
 /// scale, otherwise on high DPI the caret is `scale` times larger than the text
 /// (demo scale=1 can never expose this).
+/// How a caret's plain offset maps to a layout byte. A **selection's** focus at
+/// a block edge sits on the block's layout edge (the virtual source markers there
+/// are painted by the selection, so the caret marks the far side of them); a
+/// plain caret sits *inside* the markers (`**|bold**` / `$x|$`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CaretEdge {
+    Plain,
+    /// Layout 0 — before the opening markers.
+    BlockStart,
+    /// The block's total layout length — after the closing markers.
+    BlockEnd,
+}
+
+/// Which layout edge a **selection's focus caret** sits on, given the end
+/// block's plain length. Pure so the rule can be pinned without a layout: a range
+/// ending at a block's last plain byte marks the far side of the trailing markers
+/// (`| 丙 | 丁 |` → after the last `|`), a range starting at plain 0 the near side
+/// of the opening ones; a collapsed caret stays inside the markers.
+fn focus_caret_edge(sel: Sel, end_block_plain_len: usize) -> CaretEdge {
+    if sel.collapsed() {
+        return CaretEdge::Plain;
+    }
+    let (start, end) = sel.range();
+    if sel.focus == end {
+        if end.off >= end_block_plain_len {
+            CaretEdge::BlockEnd
+        } else {
+            CaretEdge::Plain
+        }
+    } else if sel.focus == start && start.off == 0 {
+        CaretEdge::BlockStart
+    } else {
+        CaretEdge::Plain
+    }
+}
+
 fn inline_caret(
     doc: &BaseDocument,
     nid: blitz_dom::NodeId,
     el: &ElementData,
     off: usize,
     scale: f32,
+    edge: CaretEdge,
 ) -> Option<InlineCaret> {
     let tl = el.inline_layout_data.as_ref()?;
     let layout = &tl.layout;
@@ -841,7 +1165,12 @@ fn inline_caret(
     // layout has a negative offset; observed y=-40).
     layout.lines().next()?;
     // plain bytes → layout bytes (the atom node's mapping)
-    let lbyte = plain_to_layout(doc, nid, off).unwrap_or(off);
+    let mapped = match edge {
+        CaretEdge::Plain => plain_to_layout(doc, nid, off),
+        CaretEdge::BlockStart => Some(0),
+        CaretEdge::BlockEnd => plain_to_layout(doc, nid, usize::MAX),
+    };
+    let lbyte = mapped.unwrap_or(off);
     // A soft-break fold point must use Upstream (line-end wins), otherwise a
     // caret at a fold point's line end is drawn at the next line's start.
     let cur = Cursor::from_byte_index(layout, lbyte, resolved_affinity(layout, lbyte));
@@ -976,6 +1305,15 @@ fn atomic_vlen(el: &ElementData) -> Option<usize> {
     attr_usize(el, "data-vlen")
 }
 
+/// A revealed Markdown delimiter (`data-vmark`, written by [`crate::render`] when
+/// the source expansion is on): it occupies that many **layout** bytes and
+/// **zero** plain bytes. Both directions skip it, so `Pos.off` keeps measuring
+/// the model's `plain_text` — a click inside `**bold**`'s delimiter snaps to the
+/// boundary it decorates instead of counting the marker as text.
+fn marker_bytes(el: &ElementData) -> Option<usize> {
+    attr_usize(el, "data-vmark")
+}
+
 /// Pre-order traverse a data-bid element's subtree, mapping layout bytes to
 /// plain bytes. Returns None when `byte` is past the text (the caller clamps to
 /// the block end).
@@ -1020,6 +1358,15 @@ fn walk_l2p(
             }
         }
         blitz_dom::NodeData::Element(el) => {
+            if let Some(v) = marker_bytes(el) {
+                // Source-expansion delimiter: layout bytes, no plain bytes. A hit
+                // inside it is the plain boundary it decorates.
+                if byte <= *acc_layout + v {
+                    return Some(*acc_plain);
+                }
+                *acc_layout += v;
+                return None;
+            }
             if let Some(v) = atomic_vlen(el) {
                 // Atom node: occupies no layout bytes, but occupies plain
                 // bytes. When byte lands on (or before) the atom's front edge →
@@ -1058,10 +1405,20 @@ pub(crate) fn plain_to_layout(
     let node = doc.get_node(bid_node)?;
     let mut acc_plain = 0usize;
     let mut acc_layout = 0usize;
-    for &c in &node.children {
-        if let Some(l) = walk_p2l(doc, c, off, &mut acc_plain, &mut acc_layout) {
+    let mut i = 0;
+    while i < node.children.len() {
+        let c = node.children[i];
+        // Is the next sibling an opening delimiter? (see the text branch of walk_p2l)
+        let opens_next = node
+            .children
+            .get(i + 1)
+            .and_then(|&n| doc.get_node(n))
+            .and_then(|n| n.data.downcast_element().map(is_opening_marker))
+            .unwrap_or(false);
+        if let Some(l) = walk_p2l(doc, c, off, &mut acc_plain, &mut acc_layout, opens_next) {
             return Some(l);
         }
+        i += 1;
     }
     // off == usize::MAX (a selection to the block end) or off past all the
     // plain: both land at the block end.
@@ -1074,12 +1431,22 @@ fn walk_p2l(
     off: usize,
     acc_plain: &mut usize,
     acc_layout: &mut usize,
+    next_opens: bool,
 ) -> Option<usize> {
     let node = doc.get_node(id)?;
     match &node.data {
         blitz_dom::NodeData::Text(t) => {
             let len = t.content.len();
-            let hit = off <= *acc_plain + len;
+            // The end of a text node is also the plain boundary of whatever follows
+            // it. When that is an **opening delimiter** the caret belongs *after*
+            // the delimiter (`**|bold**`), so the boundary is left to the marker
+            // branch below instead of being claimed here — otherwise → at the end of
+            // "abc" in `abc**bold**` visually stepped over `**b`.
+            let hit = if next_opens {
+                off < *acc_plain + len
+            } else {
+                off <= *acc_plain + len
+            };
             let l = *acc_layout + (off.saturating_sub(*acc_plain)).min(len);
             *acc_plain += len;
             *acc_layout += len;
@@ -1090,6 +1457,21 @@ fn walk_p2l(
             }
         }
         blitz_dom::NodeData::Element(el) => {
+            if let Some(v) = marker_bytes(el) {
+                // Source-expansion delimiter: the caret at this plain boundary is
+                // drawn **inside** the source when the marker opens it (`$|x$`) and
+                // **before** it when the marker closes it (`$x|$`) — one monotonic
+                // walk through the visible source, no delimiter stepped over.
+                if off <= *acc_plain {
+                    return Some(if is_opening_marker(el) {
+                        *acc_layout + v
+                    } else {
+                        *acc_layout
+                    });
+                }
+                *acc_layout += v;
+                return None;
+            }
             if let Some(v) = atomic_vlen(el) {
                 let hit = off <= *acc_plain + v;
                 let l = *acc_layout; // snap to the atom's front edge
@@ -1103,15 +1485,29 @@ fn walk_p2l(
                 }
                 return None;
             }
-            for &c in &node.children {
-                if let Some(l) = walk_p2l(doc, c, off, acc_plain, acc_layout) {
+            let mut i = 0;
+            while i < node.children.len() {
+                let c = node.children[i];
+                // Is the **next** sibling an opening delimiter? (see the text branch)
+                let opens_next = node
+                    .children
+                    .get(i + 1)
+                    .and_then(|&n| doc.get_node(n))
+                    .and_then(|n| n.data.downcast_element().map(is_opening_marker))
+                    .unwrap_or(false);
+                if let Some(l) = walk_p2l(doc, c, off, acc_plain, acc_layout, opens_next) {
                     return Some(l);
                 }
+                i += 1;
             }
             None
         }
         _ => None,
     }
+}
+
+fn is_opening_marker(el: &ElementData) -> bool {
+    marker_bytes(el).is_some() && el.attrs().iter().any(|a| &*a.name.local == "data-vopen")
 }
 
 /// The block's total layout byte count (= the plain length when there are no
@@ -1137,8 +1533,10 @@ fn has_text_node(doc: &BaseDocument, id: blitz_dom::NodeId) -> bool {
         blitz_dom::NodeData::Text(_) => true,
         blitz_dom::NodeData::Element(el) => {
             // An atom is a leaf for the text search too (its alt/src is an
-            // attribute, not a text node).
-            if atomic_vlen(el).is_some() {
+            // attribute, not a text node); a source-expansion delimiter is
+            // notation, not text (a block must not look non-empty because a
+            // revealed `**` sits in it).
+            if atomic_vlen(el).is_some() || marker_bytes(el).is_some() {
                 return false;
             }
             node.children.iter().any(|&c| has_text_node(doc, c))
@@ -1183,6 +1581,11 @@ fn walk_atomic_end(
             None
         }
         blitz_dom::NodeData::Element(el) => {
+            // A source-expansion delimiter has layout bytes but no plain bytes, so
+            // it can never be the atom a caret sits at the end of.
+            if marker_bytes(el).is_some() {
+                return None;
+            }
             if let Some(v) = atomic_vlen(el) {
                 let end = *acc_plain + v;
                 // The caret is exactly at the atom's end, and there is no text
@@ -1253,6 +1656,10 @@ fn sum_plain(doc: &BaseDocument, id: blitz_dom::NodeId, acc: &mut usize) {
                 *acc += v;
                 return;
             }
+            // A delimiter contributes layout bytes only (see `marker_bytes`).
+            if marker_bytes(el).is_some() {
+                return;
+            }
             for &c in &node.children {
                 sum_plain(doc, c, acc);
             }
@@ -1270,6 +1677,275 @@ fn attr_str(el: &ElementData, name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use parley::{FontContext, LayoutContext};
+
+    // ---- Drag mapping across a table's edges -------------------------------
+    //
+    // The geometry (band distances) needs a real layout, but the **decision**
+    // `table_edge_pos` is pure — that is where the "table ends the document"
+    // rule lives, so it is pinned here.
+
+    /// A point past the table's top/bottom lands on the table's first/last cell,
+    /// whatever column the pointer is over; a point inside the rows keeps the
+    /// per-cell mapping. Below the **last row's content** (cell padding, the
+    /// source table's delimiter row) the table's end wins too — that is the shape
+    /// a table ending the document has, where nothing below can rescue the sweep.
+    #[test]
+    fn table_edges_own_the_drag_past_them() {
+        let doc = crate::md::parse("| a | b |\n|---|---|\n| c | d |");
+        assert_eq!(doc.blocks.len(), 4, "{:?}", doc.blocks);
+        let (first, last) = (0usize, 3usize);
+        // Geometry: the table spans 100..160, the winning row's content ends at 154.
+        let band = (first, last, (100.0, 160.0), 154.0);
+        let at = |dy: f32, in_last_row: bool| {
+            table_edge_pos(&doc, band.0, band.1, band.2, band.3, in_last_row, dy)
+        };
+        // Inside the rows: the cell under the pointer decides (no override).
+        assert_eq!(at(130.0, false), None);
+        assert_eq!(at(130.0, true), None);
+        // Past the top: the table's start.
+        assert_eq!(at(90.0, false), Some(Pos::new(first, 0)));
+        // Past the bottom: the table's end — the last character of the last cell
+        // is inside the selection now, not just the cell under the pointer's x.
+        assert_eq!(at(170.0, true), Some(Pos::new(last, 1)));
+        // Inside the table box but below the last row's content: the end as well,
+        // but only when the winning row IS the last one (between rows, the cell
+        // under the pointer stays the answer).
+        assert_eq!(at(158.0, true), Some(Pos::new(last, 1)));
+        assert_eq!(at(158.0, false), None);
+    }
+
+    /// `same_row` reads the model's `row` field (the flag `table_edge_pos` needs
+    /// to know whether "below the row" means "below the table").
+    #[test]
+    fn same_row_reads_the_row_field() {
+        let doc = crate::md::parse("| a | b |\n|---|---|\n| c | d |");
+        assert!(same_row(&doc.blocks[0], &doc.blocks[1]), "header cells");
+        assert!(!same_row(&doc.blocks[0], &doc.blocks[2]), "header vs body");
+        assert!(same_row(&doc.blocks[2], &doc.blocks[3]), "body cells");
+    }
+
+    // ---- The virtual-byte ledger of a revealed source ----------------------
+    //
+    // `layout_to_plain` / `plain_to_layout` only read node data and attributes,
+    // so the real renderer's structure can be built headlessly (the same
+    // `DocumentMutator` harness `dom_index` uses).
+
+    use blitz_dom::{Attribute, DocumentConfig, LocalName, QualName};
+
+    fn qname(name: &str) -> QualName {
+        QualName::new(None, blitz_dom::ns!(html), LocalName::from(name))
+    }
+
+    fn attr(name: &str, value: &str) -> Attribute {
+        Attribute {
+            name: qname(name),
+            value: value.to_string(),
+        }
+    }
+
+    /// `<html><body><div data-bid="0">…children…</div></body></html>`, returning
+    /// the document and the block node.
+    fn block_doc(
+        build: impl FnOnce(&mut blitz_dom::DocumentMutator) -> Vec<blitz_dom::NodeId>,
+    ) -> (BaseDocument, blitz_dom::NodeId) {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(blitz_traits::shell::Viewport::new(
+                400,
+                300,
+                1.0,
+                blitz_traits::shell::ColorScheme::Light,
+            )),
+            ..Default::default()
+        });
+        let root = doc.root_node().id;
+        let (html, block) = {
+            let mut m = doc.mutate();
+            let html = m.create_element(qname("html"), vec![]);
+            let body = m.create_element(qname("body"), vec![]);
+            let block = m.create_element(qname("div"), vec![attr("data-bid", "0")]);
+            let kids = build(&mut m);
+            m.append_children(block, &kids);
+            m.append_children(body, &[block]);
+            m.append_children(html, &[body]);
+            m.append_children(root, &[html]);
+            (html, block)
+        };
+        let _ = html;
+        (doc, block)
+    }
+
+    /// `<span data-vmark=..>`: a revealed Markdown delimiter.
+    fn marker(m: &mut blitz_dom::DocumentMutator, text: &str, open: bool) -> blitz_dom::NodeId {
+        let attrs = if open {
+            vec![
+                attr("data-vmark", &text.len().to_string()),
+                attr("data-vopen", "1"),
+            ]
+        } else {
+            vec![attr("data-vmark", &text.len().to_string())]
+        };
+        let span = m.create_element(qname("span"), attrs);
+        let t = m.create_text_node(text);
+        m.append_children(span, &[t]);
+        span
+    }
+
+    /// The caret of a **selection's focus** follows the selection's edge: a range
+    /// ending at the table's last cell puts the caret after the trailing ` |`
+    /// (the painted range covers it), not between `丁` and the pipe.
+    #[test]
+    fn a_selection_focus_caret_sits_on_the_painted_edge() {
+        let sel = |a: (usize, usize), b: (usize, usize)| crate::model::Sel {
+            anchor: Pos::new(a.0, a.1),
+            focus: Pos::new(b.0, b.1),
+        };
+        // Selecting down to the table's end (focus = the last cell's end): after
+        // the trailing markers.
+        assert_eq!(
+            focus_caret_edge(sel((0, 0), (3, 1)), 1),
+            CaretEdge::BlockEnd
+        );
+        // Dragging **upward** from inside the table: the focus is the range's
+        // start at plain 0 → before the opening markers.
+        assert_eq!(
+            focus_caret_edge(sel((3, 1), (0, 0)), 1),
+            CaretEdge::BlockStart
+        );
+        // A focus inside a block keeps the plain mapping.
+        assert_eq!(focus_caret_edge(sel((0, 0), (3, 0)), 1), CaretEdge::Plain);
+        assert_eq!(focus_caret_edge(sel((3, 0), (0, 3)), 1), CaretEdge::Plain);
+        // A collapsed caret stays inside the markers.
+        assert_eq!(focus_caret_edge(sel((3, 1), (3, 1)), 1), CaretEdge::Plain);
+    }
+
+    /// A **range** reaching a block's first/last plain byte paints the block's
+    /// layout edges — the virtual markers at the edges are part of the copied
+    /// text, so the highlight must cover them. A caret keeps the plain mapping
+    /// (it belongs *inside* the markers).
+    #[test]
+    fn a_range_paints_the_virtual_markers_at_its_edges() {
+        let (doc, block) = block_doc(|m| {
+            let open = marker(m, "**", true);
+            let strong = m.create_element(qname("strong"), vec![]);
+            let text = m.create_text_node("bold");
+            m.append_children(strong, &[text]);
+            let close = marker(m, "**", false);
+            vec![open, strong, close]
+        });
+        let span = |a: usize, b: usize, collapsed: bool| {
+            selection_layout_span(&doc, block, block, a, b, collapsed)
+        };
+        // The whole block: from layout 0 (before `**`) to layout 8 (after the
+        // closing `**`) — what a copy of the full block writes.
+        assert_eq!(span(0, 4, false), Some((0, 8)));
+        // A range from the first character to the block end: the opening marker is
+        // covered too (start == plain 0), the closing one follows the end.
+        assert_eq!(span(0, 4, false), Some((0, 8)));
+        // Mid-range: plain → layout as usual.
+        assert_eq!(span(0, 2, false), Some((0, 4)));
+        assert_eq!(span(1, 3, false), Some((3, 5)));
+        // A caret stays inside the markers (`**|bold**`).
+        assert_eq!(span(0, 0, true), Some((2, 2)));
+        assert_eq!(span(4, 4, true), Some((6, 6)));
+    }
+
+    /// A revealed `**bold**`: delimiters are layout bytes but **not** plain
+    /// bytes, so the two ledgers must both agree with the model's `plain_text`.
+    #[test]
+    fn revealed_markers_are_virtual_in_both_directions() {
+        let (doc, block) = block_doc(|m| {
+            let open = marker(m, "**", true);
+            let strong = m.create_element(qname("strong"), vec![]);
+            let text = m.create_text_node("bold");
+            m.append_children(strong, &[text]);
+            let close = marker(m, "**", false);
+            vec![open, strong, close]
+        });
+        // Plain text is "bold" (4 bytes); the layout stream is `**bold**` (8).
+        assert_eq!(block_plain_len(&doc, block), 4);
+        assert_eq!(plain_to_layout(&doc, block, usize::MAX), Some(8));
+        // layout → plain: a hit inside either delimiter snaps to the boundary it
+        // decorates, text bytes map one to one.
+        for (byte, plain) in [(0, 0), (1, 0), (2, 0), (4, 2), (6, 4), (8, 4)] {
+            assert_eq!(
+                layout_to_plain(&doc, block, byte),
+                Some(plain),
+                "layout {byte} → plain"
+            );
+        }
+        // plain → layout: at the content start the caret is drawn **inside** the
+        // opening delimiter, at the content end it stays in front of the closing
+        // one (one monotonic walk through the source).
+        assert_eq!(plain_to_layout(&doc, block, 0), Some(2));
+        assert_eq!(plain_to_layout(&doc, block, 2), Some(4));
+        assert_eq!(plain_to_layout(&doc, block, 4), Some(6));
+    }
+
+    /// The plain boundary at the end of a text run is also the front edge of the
+    /// delimiter that follows it — and the caret belongs **after** an opening
+    /// delimiter, so `abc|**bold**` must draw after `**` (not before it, which made
+    /// one → press look like it stepped over `**b`).
+    #[test]
+    fn boundary_before_an_opening_marker_draws_inside_it() {
+        let (doc, block) = block_doc(|m| {
+            let text = m.create_text_node("abc");
+            let open = marker(m, "**", true);
+            let inner = m.create_text_node("bold");
+            let close = marker(m, "**", false);
+            vec![text, open, inner, close]
+        });
+        // plain "abcbold"; the caret at the end of "abc" (off 3) sits after `**`.
+        assert_eq!(plain_to_layout(&doc, block, 3), Some(5));
+        assert_eq!(plain_to_layout(&doc, block, 2), Some(2));
+        // The closing delimiter keeps the content end in front of itself.
+        assert_eq!(plain_to_layout(&doc, block, 7), Some(9));
+    }
+
+    /// A revealed formula: the LaTeX is real text (identity mapping), the `$`
+    /// delimiters are virtual, and the carrier is not an atom any more (no
+    /// `data-vlen`) — that is what lets the caret live inside the source.
+    #[test]
+    fn revealed_formula_source_maps_identically() {
+        let (doc, block) = block_doc(|m| {
+            let open = marker(m, "$", true);
+            let src = m.create_element(qname("span"), vec![attr("data-math", "")]);
+            let text = m.create_text_node("x+y");
+            m.append_children(src, &[text]);
+            let close = marker(m, "$", false);
+            vec![open, src, close]
+        });
+        assert_eq!(block_plain_len(&doc, block), 3);
+        assert_eq!(plain_to_layout(&doc, block, usize::MAX), Some(5));
+        for off in 0..=3 {
+            assert_eq!(
+                layout_to_plain(&doc, block, off + 1),
+                Some(off),
+                "the source maps 1:1"
+            );
+        }
+        assert_eq!(plain_to_layout(&doc, block, 1), Some(2));
+    }
+
+    /// An atom (a typeset formula / an image) is still walked as an opaque block:
+    /// the virtual-byte branch must not shadow `data-vlen`.
+    #[test]
+    fn atom_vlen_still_wins_over_plain_walk() {
+        let (doc, block) = block_doc(|m| {
+            let a = m.create_text_node("ab");
+            let atom = m.create_element(
+                qname("span"),
+                vec![attr("data-math", ""), attr("data-vlen", "3")],
+            );
+            let b = m.create_text_node("cd");
+            vec![a, atom, b]
+        });
+        assert_eq!(block_plain_len(&doc, block), 7);
+        // Layout bytes: "ab" (0..2) + atom (0) + "cd" (2..4). A click on the `d`
+        // (layout 3) is plain 6 — the atom's virtual bytes sit between.
+        assert_eq!(layout_to_plain(&doc, block, 3), Some(6));
+        // …and the caret inside the atom's range snaps to its front edge.
+        assert_eq!(plain_to_layout(&doc, block, 4), Some(2));
+    }
 
     /// Headlessly construct a parley layout (same engine as blitz's inline
     /// layout; tests only line breaking and the Cursor API, so no real DOM is

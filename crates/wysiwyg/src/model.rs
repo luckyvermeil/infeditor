@@ -302,6 +302,24 @@ impl Block {
         out
     }
 
+    /// Plain-byte ranges of the **image alts** in a block (same walk and
+    /// coordinate system as [`Block::math_spans`]). Allocates nothing when the
+    /// block has no image.
+    pub fn image_spans(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut acc = 0usize;
+        match self {
+            Block::Para(i)
+            | Block::Head { inlines: i, .. }
+            | Block::Li { inlines: i, .. }
+            | Block::Quote(i)
+            | Block::Td { inlines: i, .. } => walk_image_spans(i, &mut acc, &mut out),
+            Block::Quoted { inner, .. } => return inner.image_spans(),
+            Block::Code { .. } | Block::Html { .. } | Block::Hr => {}
+        }
+        out
+    }
+
     /// Whether the block contains math (no allocation; a quick short-circuit
     /// before click hit-testing).
     pub fn has_math(&self) -> bool {
@@ -370,6 +388,23 @@ fn walk_math_spans(inl: &[Inline], acc: &mut usize, out: &mut Vec<(usize, usize)
             | Inline::Em(c)
             | Inline::Del(c)
             | Inline::Link { inlines: c, .. } => walk_math_spans(c, acc, out),
+            other => *acc += other.plain_len(),
+        }
+    }
+}
+
+/// Same walk as [`walk_math_spans`], collecting the image alts instead.
+fn walk_image_spans(inl: &[Inline], acc: &mut usize, out: &mut Vec<(usize, usize)>) {
+    for i in inl {
+        match i {
+            Inline::Image { alt, .. } => {
+                out.push((*acc, *acc + alt.len()));
+                *acc += alt.len();
+            }
+            Inline::Strong(c)
+            | Inline::Em(c)
+            | Inline::Del(c)
+            | Inline::Link { inlines: c, .. } => walk_image_spans(c, acc, out),
             other => *acc += other.plain_len(),
         }
     }

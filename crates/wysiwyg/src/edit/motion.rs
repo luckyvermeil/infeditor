@@ -5,7 +5,11 @@ use super::inlines::*;
 use super::*;
 
 /// Pure-logic movement: the previous character boundary (across blocks).
-pub(crate) fn move_left(doc: &Doc, p: Pos) -> Pos {
+///
+/// `edit` is the plain range of the formula whose **source is on screen** (see
+/// [`crate::reveal`]): that atom is text the user is editing, so the atom
+/// skipping below must not apply to it.
+pub(crate) fn move_left(doc: &Doc, p: Pos, edit: Option<(usize, usize)>) -> Pos {
     if p.off > 0 {
         let plain = doc
             .blocks
@@ -18,6 +22,9 @@ pub(crate) fn move_left(doc: &Doc, p: Pos) -> Pos {
         // from inside it) jumps straight to the atomic's left edge.
         if let Some(b) = doc.blocks.get(p.block) {
             for (s, e) in atom_bounds(b) {
+                if Some((s, e)) == edit {
+                    continue; // an editing formula is ordinary text
+                }
                 if off > s && off <= e {
                     off = s;
                     break;
@@ -36,7 +43,7 @@ pub(crate) fn move_left(doc: &Doc, p: Pos) -> Pos {
     )
 }
 
-pub(crate) fn move_right(doc: &Doc, p: Pos) -> Pos {
+pub(crate) fn move_right(doc: &Doc, p: Pos, edit: Option<(usize, usize)>) -> Pos {
     let plain = doc
         .blocks
         .get(p.block)
@@ -48,6 +55,9 @@ pub(crate) fn move_right(doc: &Doc, p: Pos) -> Pos {
         // left edge or inside it lands on the atomic's right edge).
         if let Some(b) = doc.blocks.get(p.block) {
             for (s, e) in atom_bounds(b) {
+                if Some((s, e)) == edit {
+                    continue; // an editing formula is ordinary text
+                }
                 if off > s && off <= e {
                     off = e;
                     break;
@@ -67,7 +77,7 @@ pub(crate) fn move_right(doc: &Doc, p: Pos) -> Pos {
 
 /// Word movement: find a word boundary inside the block; at the end, jump to the
 /// next block.
-pub(crate) fn move_word_left(doc: &Doc, p: Pos) -> Pos {
+pub(crate) fn move_word_left(doc: &Doc, p: Pos, edit: Option<(usize, usize)>) -> Pos {
     let plain = doc
         .blocks
         .get(p.block)
@@ -75,7 +85,11 @@ pub(crate) fn move_word_left(doc: &Doc, p: Pos) -> Pos {
         .unwrap_or_default();
     if p.off > 0 {
         let mut i = char_boundary_before(&plain, p.off);
-        let atoms = doc.blocks.get(p.block).map(atom_bounds).unwrap_or_default();
+        let mut atoms = doc.blocks.get(p.block).map(atom_bounds).unwrap_or_default();
+        // An editing formula is text: no atom jump, no "one indivisible word".
+        if let Some(edit) = edit {
+            atoms.retain(|a| *a != edit);
+        }
         let mut out_of_atom = false;
         for (s, e) in &atoms {
             if i > *s && i <= *e {
@@ -125,7 +139,7 @@ pub(crate) fn move_word_left(doc: &Doc, p: Pos) -> Pos {
     )
 }
 
-pub(crate) fn move_word_right(doc: &Doc, p: Pos) -> Pos {
+pub(crate) fn move_word_right(doc: &Doc, p: Pos, edit: Option<(usize, usize)>) -> Pos {
     let plain = doc
         .blocks
         .get(p.block)
@@ -133,7 +147,10 @@ pub(crate) fn move_word_right(doc: &Doc, p: Pos) -> Pos {
         .unwrap_or_default();
     if p.off < plain.len() {
         let mut i = char_boundary_after(&plain, p.off.min(plain.len()));
-        let atoms = doc.blocks.get(p.block).map(atom_bounds).unwrap_or_default();
+        let mut atoms = doc.blocks.get(p.block).map(atom_bounds).unwrap_or_default();
+        if let Some(edit) = edit {
+            atoms.retain(|a| *a != edit);
+        }
         // Same as move_word_left: an atom is one word. Leaving it goes to its
         // right edge and stops there — the class run below used to walk straight
         // through the source into the text after it.

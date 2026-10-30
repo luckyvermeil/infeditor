@@ -1611,7 +1611,7 @@ fn cross_block_delete_in_td_keeps_inline_structure() {
     );
 }
 
-/// Math is an atomic node — a partial delete becomes a whole delete, leaving no
+/// Math is an atomic node — any partial delete becomes a whole delete, leaving no
 /// half-src shell behind (it used to emit a truncated `$$…$$`).
 #[test]
 fn partial_delete_of_math_removes_whole_node() {
@@ -1622,31 +1622,43 @@ fn partial_delete_of_math_removes_whole_node() {
             display: true,
         },
     ])]);
-    // A selection that ends inside the formula's source takes the atom whole:
-    // plain = "ax+y", the range 1..3 covers half of `x+y`.
+    // The selection starts *before* the formula and ends inside its source
+    // (plain = "ax+y", the range 0..3 covers the "a" and half of `x+y`): the
+    // formula is taken whole.
     let mut e = Editor::new(doc.clone());
     e.sel = Sel {
-        anchor: Pos::new(0, 1),
+        anchor: Pos::new(0, 0),
         focus: Pos::new(0, 3),
     };
     e.apply(Cmd::DeleteSelection);
     assert_eq!(
         text_at(&e, 0),
-        "a",
+        "",
         "the Math is deleted whole: {:?}",
         e.doc.blocks[0]
     );
-    let Block::Para(inl) = &e.doc.blocks[0] else {
-        panic!()
+    // A selection that **stays inside** the formula keeps its source on screen
+    // (see `reveal`), so it is text the user is editing: the covered characters go
+    // and the formula survives instead of leaving a truncated `$+y$` shell.
+    let mut e = Editor::new(doc.clone());
+    e.sel = Sel {
+        anchor: Pos::new(0, 1),
+        focus: Pos::new(0, 3),
     };
-    assert!(!inl.iter().any(|i| matches!(i, Inline::Math { .. })));
+    assert_eq!(
+        e.reveal().editing_span(0),
+        Some((1, 4)),
+        "the source is shown"
+    );
+    e.apply(Cmd::DeleteSelection);
+    assert_eq!(text_at(&e, 0), "ay", "{:?}", e.doc.blocks[0]);
+    assert_eq!(md::emit(&e.doc), "a$$y$$\n", "one formula, its tail left");
 
-    // A **caret** cannot sit inside the atom: it is snapped to the front edge, so
-    // Backspace deletes the character before the formula instead of the formula
-    // (the old behavior deleted all of `x+y` from a caret the user saw drawn in
-    // front of it).
+    // A caret at the formula's **left edge** deletes the character before it, not
+    // the formula (the old behaviour deleted all of `x+y` from a caret the user saw
+    // drawn in front of it).
     let mut e = Editor::new(doc);
-    at(&mut e, 0, 3);
+    at(&mut e, 0, 1);
     assert!(e.apply(Cmd::DeleteBack));
     assert_eq!(
         text_at(&e, 0),
@@ -1654,6 +1666,25 @@ fn partial_delete_of_math_removes_whole_node() {
         "the formula survives: {:?}",
         e.doc.blocks[0]
     );
+}
+
+/// An image whose alt is on screen (the caret sits inside it) is edited as text:
+/// Backspace takes one alt character and the image survives — the alt is drawn as
+/// real text, so the character the caret covers is the character that goes.
+#[test]
+fn backspace_inside_an_image_alt_keeps_the_image() {
+    let mut e = Editor::new(Doc::new(vec![Block::Para(vec![
+        Inline::Text("a".into()),
+        Inline::Image {
+            url: "u.png".into(),
+            alt: "IMG".into(),
+        },
+    ])]));
+    // alt = plain 1..4; the caret is strictly inside it.
+    at(&mut e, 0, 3);
+    assert!(e.apply(Cmd::DeleteBack));
+    assert_eq!(text_at(&e, 0), "aIG");
+    assert_eq!(md::emit(&e.doc), "a![IG](u.png)\n");
 }
 
 /// A Link partially deleted is unlinked — the remaining text survives, but the URL
@@ -2704,26 +2735,25 @@ fn table_align_inside_quote_shell() {
 
 // ---- Caret × atomic nodes (formula/image) × tables: multi-path matrix ----
 
-/// An inline formula/image is **one visual object**: ←/→ cross it whole and never
-/// stop inside its source/alt virtual bytes (→ used to walk into the source of
-/// `$E=mc^2$`, where the caret had nowhere to be drawn).
+/// An inline formula is **one visual object only while it is typeset**: the
+/// moment its source is on screen (the caret is at or inside it, see
+/// [`crate::reveal`]) it is ordinary text and ←/→ walk it character by
+/// character. An image keeps the atom behaviour — it never expands.
 #[test]
-fn caret_steps_over_math_and_image_atoms() {
+fn caret_walks_shown_math_and_steps_over_image_atoms() {
     let math_len = "E=mc^2".len();
     let mut e = ed("a$E=mc^2$b");
     at(&mut e, 0, 1);
     assert!(e.apply(Cmd::Move(Move::Right)));
     assert_eq!(
         caret(&e),
-        (0, 1 + math_len),
-        "→ should skip the formula whole"
+        (0, 2),
+        "the formula's source is on screen, so → enters it"
     );
-    assert!(e.apply(Cmd::Move(Move::Left)));
-    assert_eq!(
-        caret(&e),
-        (0, 1),
-        "← should jump back to the atomic's left edge in one step"
-    );
+    // Walking out of the source re-collapses it and the caret is past the atom
+    at(&mut e, 0, 1 + math_len);
+    assert!(e.apply(Cmd::Move(Move::Right)));
+    assert_eq!(caret(&e), (0, 1 + math_len + 1));
 
     let alt_len = "示例图".len();
     let mut e = ed("a![示例图](./pic.png)b");
@@ -2733,40 +2763,50 @@ fn caret_steps_over_math_and_image_atoms() {
     assert!(e.apply(Cmd::Move(Move::Left)));
     assert_eq!(caret(&e), (0, 1));
 
-    // An atomic node inside a container (Strong): still skipped whole
-    let mut e = ed("**$x$**");
+    // An atom inside a container (Strong): still skipped whole (an image again)
+    let mut e = ed("**![示例图](./pic.png)**");
     at(&mut e, 0, 0);
     assert!(e.apply(Cmd::Move(Move::Right)));
-    assert_eq!(caret(&e), (0, 1));
+    assert_eq!(caret(&e), (0, alt_len));
     assert!(e.apply(Cmd::Move(Move::Left)));
     assert_eq!(caret(&e), (0, 0));
 
-    // Word movement (Ctrl+←/→) likewise never splits a formula's source into words
+    // Word movement over a formula: while the caret is **not** at it the atom is
+    // one word (skipped whole); landed next to it the source is on screen and the
+    // walk continues through the LaTeX as ordinary text.
     let mut e = ed("词 $a+b$ 尾");
     at(&mut e, 0, 0);
     let after_math = "词 ".len() + "a+b".len();
     assert!(e.apply(Cmd::Move(Move::WordRight)));
-    assert!(
-        caret(&e).1 >= after_math,
-        "Ctrl+→ landed at {:?}",
-        caret(&e)
+    assert_eq!(caret(&e), (0, after_math), "the atom is one word");
+    assert!(e.apply(Cmd::Move(Move::WordRight)));
+    assert_eq!(
+        caret(&e),
+        (0, text_at(&e, 0).len()),
+        "the shown source is text: the run walks to the block end"
     );
 }
 
-/// Backspace/Delete remove an atom whole at its boundary (no half-source left
-/// behind).
+/// Backspace/Delete remove an image whole at its boundary (no half-alt left
+/// behind); a formula whose source is on screen loses **one LaTeX character**,
+/// which is what the caret is sitting in.
 #[test]
-fn delete_removes_math_and_image_atoms_whole() {
-    let mut e = ed("a$E=mc^2$b");
-    at(&mut e, 0, 1 + "E=mc^2".len());
-    assert!(e.apply(Cmd::DeleteBack));
-    assert_eq!(text_at(&e, 0), "ab");
-
+fn delete_takes_images_whole_and_edits_shown_math() {
     let mut e = ed("a![示例图](./pic.png)b");
     at(&mut e, 0, 1);
     assert!(e.apply(Cmd::DeleteForward));
     assert_eq!(text_at(&e, 0), "ab");
     assert_eq!(md::emit(&e.doc), "ab\n");
+
+    let mut e = ed("a$E=mc^2$b");
+    at(&mut e, 0, 1 + "E=mc^2".len());
+    assert!(e.apply(Cmd::DeleteBack));
+    assert_eq!(
+        text_at(&e, 0),
+        "aE=mc^b",
+        "the caret sits in the shown source: one character goes"
+    );
+    assert!(md::emit(&e.doc).contains("$E=mc^$"), "{}", md::emit(&e.doc));
 }
 
 /// A formula inside a table cell: the round trip is lossless, Tab/↑↓ still move
@@ -2775,11 +2815,13 @@ fn delete_removes_math_and_image_atoms_whole() {
 fn table_cells_with_math_and_marks_roundtrip() {
     let src = "| **粗** | $a^2$ | `c` |\n|---|---|---|\n| $x$ | b | [l](u) |\n";
     let mut e = ed(src);
-    // 6 cells in the same table; the header cell's formula is skipped whole
+    // 6 cells in the same table
     assert_eq!(e.doc.blocks.iter().filter(|b| b.is_td()).count(), 6);
+    // → into the header cell's formula: its source is on screen there, so the
+    // caret walks the LaTeX instead of jumping the atom
     at(&mut e, 1, 0);
     assert!(e.apply(Cmd::Move(Move::Right)));
-    assert_eq!(caret(&e), (1, "a^2".len()));
+    assert_eq!(caret(&e), (1, 1));
 
     // Tab reaches the next cell (its whole content is selected, focus at the cell start)
     assert!(e.apply(Cmd::Table(TableCmd::CellNext)));
@@ -2815,9 +2857,12 @@ fn backspace_at_cell_start_only_moves() {
 }
 
 /// Full-feature sample: at any block boundary the caret ←/→ must never stop
-/// inside an atomic node; one step right then one step left returns to the
-/// original boundary (the block-end → next-block-start → previous-block-end ring
-/// holds too).
+/// inside an atom **whose source is not on screen**; one step right then one step
+/// left returns to the original boundary (the block-end → next-block-start →
+/// previous-block-end ring holds too).
+///
+/// A formula at the caret is the documented exception: it is expanded to its
+/// LaTeX and the caret walks it as text (see [`crate::reveal`]).
 #[test]
 fn all_features_caret_never_lands_inside_atoms() {
     const SAMPLE: &str = include_str!("../../../../samples/wys-all-features.md");
@@ -2838,16 +2883,24 @@ fn all_features_caret_never_lands_inside_atoms() {
             e.apply(Cmd::Move(Move::Right));
             let (rb, ro) = caret(&e);
             if rb == bi {
+                // The atom the caret is allowed to enter: the formula whose source
+                // the reveal puts on screen right there.
+                let shown = e.reveal().editing_span(bi);
                 assert!(
-                    !atoms.iter().any(|&(s, en)| ro > s && ro < en),
+                    !atoms
+                        .iter()
+                        .any(|&(s, en)| ro > s && ro < en && Some((s, en)) != shown),
                     "block {bi} off {off} → landed inside an atomic node {ro}"
                 );
             }
             e.apply(Cmd::Move(Move::Left));
             let (lb, lo) = caret(&e);
             if lb == bi {
+                let shown = e.reveal().editing_span(bi);
                 assert!(
-                    !atoms.iter().any(|&(s, en)| lo > s && lo < en),
+                    !atoms
+                        .iter()
+                        .any(|&(s, en)| lo > s && lo < en && Some((s, en)) != shown),
                     "block {bi} off {off} ← landed inside an atomic node {lo}"
                 );
             }
@@ -3162,6 +3215,29 @@ fn trailing_space_survives_emit_round_trip() {
     );
 }
 
+/// A range that stays inside an atom whose source is on screen copies **those
+/// bytes**: re-emitting the truncated node would put `$+y$` / `![MG](u)` on the
+/// clipboard, which is neither a formula nor an image.
+#[test]
+fn selected_markdown_inside_a_shown_atom_copies_the_source() {
+    let mut e = ed("a $x+y$ b");
+    // "a " = 0..2, formula = 2..5; the range 3..5 is the "+y" of the LaTeX.
+    e.sel = Sel {
+        anchor: Pos::new(0, 3),
+        focus: Pos::new(0, 5),
+    };
+    assert_eq!(e.reveal().editing_span(0), Some((2, 5)), "source on screen");
+    assert_eq!(e.selected_markdown(), "+y");
+
+    let mut e = ed("a ![IMG](u.png) b");
+    e.sel = Sel {
+        anchor: Pos::new(0, 3),
+        focus: Pos::new(0, 5),
+    };
+    assert_eq!(e.reveal().editing_span(0), Some((2, 5)), "alt on screen");
+    assert_eq!(e.selected_markdown(), "MG");
+}
+
 /// Copy must preserve Markdown structure (inline markup / tables / formulas)
 /// instead of flattening the selection into plain text.
 #[test]
@@ -3344,16 +3420,17 @@ fn noop_command_keeps_the_redo_stack() {
     assert_eq!(text_at(&e, 0), "xabc");
 }
 
-/// An atom (formula source / image alt) is one indivisible word: the class run
-/// used to walk straight through it into the surrounding text.
+/// An atom (image alt) is one indivisible word: the class run used to walk
+/// straight through it into the surrounding text. A **formula** at the caret is
+/// the opposite — its source is on screen and walks like text (locked below).
 #[test]
 fn word_motion_treats_an_atom_as_one_word() {
-    // "abc" + Math("x+y") + "d"  →  plain "abcx+yd", atom 3..6
+    // "abc" + Image(alt "x+y") + "d"  →  plain "abcx+yd", atom 3..6
     let mut e = Editor::new(Doc::new(vec![Block::Para(vec![
         Inline::Text("abc".into()),
-        Inline::Math {
-            src: "x+y".into(),
-            display: false,
+        Inline::Image {
+            url: "./p.png".into(),
+            alt: "x+y".into(),
         },
         Inline::Text("d".into()),
     ])]));
@@ -3371,6 +3448,30 @@ fn word_motion_treats_an_atom_as_one_word() {
     // from the atom's left edge it jumps over the atom
     e.apply(Cmd::Move(Move::WordRight));
     assert_eq!(caret(&e), (0, 6), "the atom is skipped whole");
+}
+
+/// A formula is text while its source is shown: Ctrl+←/→ walk it character run
+/// by character run instead of treating it as one word.
+#[test]
+fn word_motion_walks_a_shown_formula() {
+    // plain: "abc " (0..4) + Math("x+y") (4..7) + " d"
+    let mut e = Editor::new(Doc::new(vec![Block::Para(vec![
+        Inline::Text("abc ".into()),
+        Inline::Math {
+            src: "x+y".into(),
+            display: false,
+        },
+        Inline::Text(" d".into()),
+    ])]));
+    // The caret is next to the formula → its source is on screen.
+    at(&mut e, 0, 7);
+    assert_eq!(e.reveal().editing_span(0), Some((4, 7)));
+    e.apply(Cmd::Move(Move::WordLeft));
+    assert_eq!(caret(&e), (0, 6), "one class run left: the `y`");
+    e.apply(Cmd::Move(Move::WordLeft));
+    assert_eq!(caret(&e), (0, 5), "the `+`");
+    e.apply(Cmd::Move(Move::WordLeft));
+    assert_eq!(caret(&e), (0, 4), "the `x`");
 }
 
 /// A vertical move into a CJK cell clamps the column onto a character boundary
@@ -3503,7 +3604,8 @@ fn delete_forward_at_code_end_joins_on_a_new_line() {
 // ---------------------------------------------------------------------------
 
 /// Typing with the caret "inside" an image alt must not split the image: it used
-/// to become **two** images with half an alt each (`![I](u)X![MG](u)`).
+/// to become **two** images with half an alt each (`![I](u)X![MG](u)`). The alt is
+/// the text on screen there, so the character goes into it.
 #[test]
 fn typing_inside_an_image_alt_does_not_duplicate_the_image() {
     let mut e = Editor::new(Doc::new(vec![Block::Para(vec![
@@ -3525,12 +3627,13 @@ fn typing_inside_an_image_alt_does_not_duplicate_the_image() {
         1,
         "one image in, one image out: {inl:?}"
     );
-    assert_eq!(text_at(&e, 0), "aXIMG");
-    assert_eq!(md::emit(&e.doc), "aX![IMG](u.png)\n");
+    assert_eq!(text_at(&e, 0), "aIXMG", "the alt is the text being edited");
+    assert_eq!(md::emit(&e.doc), "a![IXMG](u.png)\n");
 }
 
-/// Typing with the caret "inside" a formula's source keeps the formula whole (it
-/// used to split into `$x+$Z$y$`).
+/// Typing inside a formula whose source is on screen edits the **LaTeX in
+/// place**: one formula in, one formula out — it used to split into
+/// `$x+$Z$y$` because an interior offset was treated as "inside an atom".
 #[test]
 fn typing_inside_a_math_source_keeps_the_formula_whole() {
     let mut e = Editor::new(Doc::new(vec![Block::Para(vec![Inline::Math {
@@ -3549,8 +3652,29 @@ fn typing_inside_a_math_source_keeps_the_formula_whole() {
         1,
         "one formula in, one formula out: {inl:?}"
     );
-    assert!(matches!(&inl[1], Inline::Math { src, .. } if src == "x+y"));
-    assert_eq!(text_at(&e, 0), "Zx+y");
+    assert!(
+        matches!(&inl[0], Inline::Math { src, .. } if src == "x+Zy"),
+        "the character went into the source: {inl:?}"
+    );
+    assert_eq!(text_at(&e, 0), "x+Zy");
+    assert_eq!(caret(&e), (0, 3));
+    // The caret is still inside the source, so it stays expanded.
+    assert_eq!(e.reveal().editing_span(0), Some((0, 4)));
+}
+
+/// Typing at a formula's **left edge** prepends text to the line instead of
+/// rewriting the formula: the edge belongs to the surrounding text, only the
+/// interior is the source. Without that carve-out a paragraph that *starts* with a
+/// formula could never get a character in front of it.
+#[test]
+fn typing_at_a_shown_formulas_left_edge_prepends_text() {
+    let mut e = ed("$x$ tail");
+    assert_eq!(text_at(&e, 0), "x tail");
+    at(&mut e, 0, 0);
+    assert_eq!(e.reveal().editing_span(0), Some((0, 1)), "source on screen");
+    e.apply(Cmd::InsertText("a".into()));
+    assert_eq!(text_at(&e, 0), "ax tail");
+    assert_eq!(md::emit(&e.doc), "a$x$ tail\n");
 }
 
 /// Enter with the caret "inside" an atom splits at its front edge: the atom moves

@@ -210,6 +210,10 @@ fn block_plain_bytes(b: &Block) -> usize {
 pub struct Editor {
     pub doc: Doc,
     pub sel: Sel,
+    /// True while the pointer owns the selection. Unlike a keyboard selection,
+    /// a drag expands the whole block under the moving end even when the
+    /// pointer is over that block's blank start/end or right margin.
+    pub dragging: bool,
     /// Target column for vertical movement (block content-box coordinate x, in
     /// physical pixels). Maintained by `move_visual_cmd` while ↑/↓ are chained: the
     /// column is kept when crossing rows or empty paragraphs shorter than it; any
@@ -232,6 +236,7 @@ impl Clone for Editor {
         Self {
             doc: self.doc.clone(),
             sel: self.sel,
+            dragging: self.dragging,
             h_pos: self.h_pos,
             undo: Arc::clone(&self.undo),
         }
@@ -267,9 +272,25 @@ impl Editor {
         Self {
             doc,
             sel,
+            dragging: false,
             h_pos: None,
             undo: Arc::default(),
         }
+    }
+
+    /// What the document view shows as Markdown source right now (see
+    /// [`crate::reveal`]): whole blocks touched by the selection, plus the one
+    /// formula expanded at the caret.
+    ///
+    /// Derived from `sel` on every call — **never stored**. The expansion has to
+    /// follow the pointer *while* the selection grows (a drag turns each block it
+    /// sweeps into source), so there is no frozen snapshot to go stale.
+    ///
+    /// **One entry point on purpose** — the render layer, the geometry mapping
+    /// and the edit layer must all agree on which nodes are expanded, otherwise
+    /// the caret ledger and the DOM drift apart.
+    pub fn reveal(&self) -> crate::reveal::Reveal {
+        crate::reveal::Reveal::from_editor(self)
     }
 
     /// The URL of the link inline covering `pos` (the Ctrl+click open target).
@@ -308,6 +329,11 @@ impl Editor {
         self.doc = doc;
         self.sel = Sel::caret(Pos::new(0, 0));
         self.h_pos = None;
+        // A drag that was in flight belongs to the old document (its reveal no longer
+        // means anything).
+        self.dragging = false;
+        // The measured typeset heights belong to the old document.
+        crate::render::clear_height_floors();
         let mut log = self.undo.lock().unwrap_or_else(|e| e.into_inner());
         log.undo.clear();
         log.redo.clear();
@@ -393,14 +419,35 @@ impl Editor {
             // user saw in front of a formula used to delete the whole formula, and
             // typing turned one image into two. A **selection** endpoint is left
             // alone — a range that partially covers an atom is handled by the range
-            // consumers (delete takes the atom whole), so widening or collapsing it
-            // here would change what the user dragged over.
+            // consumers (a range reaching the atom's edge takes it whole), so
+            // widening or collapsing it here would change what the user dragged
+            // over.
+            //
+            // Exception: an atom whose **text is on screen** ([`the reveal`]) — a
+            // formula at the caret, a range that stays inside one, an image whose
+            // alt is being edited — is text the user is editing; its interior
+            // offsets are real caret positions and snapping them out would make
+            // that text readonly. (Only the collapsed caret is normalized here; a
+            // range keeps both endpoints as they are, and the reveal's
+            // `editing_span` covers a range that stays inside the atom.)
+            //
+            // [`the reveal`]: Editor::reveal
             let collapsed = self.sel.collapsed();
+            let reveal = if collapsed {
+                self.reveal()
+            } else {
+                crate::reveal::Reveal::none()
+            };
             for pos in [&mut self.sel.anchor, &mut self.sel.focus] {
                 let len = self.doc.blocks[pos.block].plain_len();
                 pos.off = pos.off.min(len);
                 if collapsed {
-                    pos.off = atom_floor_block(&self.doc.blocks[pos.block], pos.off);
+                    let inside_editing_atom = reveal
+                        .editing_span(pos.block)
+                        .is_some_and(|(s, e)| pos.off > s && pos.off < e);
+                    if !inside_editing_atom {
+                        pos.off = atom_floor_block(&self.doc.blocks[pos.block], pos.off);
+                    }
                 }
             }
         }

@@ -14,6 +14,8 @@
 //! - [`model`] block tree + `Pos` logical coordinates
 //! - [`md`]    Markdown ↔ Doc (pulldown-cmark parsing / hand-written emit)
 //! - [`render`] Doc → HTML string (injected via `dangerous_inner_html`)
+//! - [`reveal`] "show the source where the user is working": a selection shows
+//!   its Markdown delimiters, the formula at the caret shows its LaTeX
 //! - [`geom`]  bidirectional coordinate queries (click→Pos; Pos→caret rect,
 //!   parley `Cursor`)
 //! - [`ui`]    the `Wysiwyg` component (event wiring, caret overlay)
@@ -33,6 +35,7 @@ pub mod model;
 pub mod paste;
 pub mod preview;
 pub mod render;
+pub mod reveal;
 pub mod ui;
 
 pub use edit::{Cmd, Editor, Move, TableCmd, WrapKind};
@@ -47,6 +50,9 @@ pub use preview::{escape_html, github_css, preview_html, safe_link_url};
 // before entering the block tree (the edit view does not go through here)
 pub use chem::parse_for_preview;
 pub mod hl;
+// "Show the Markdown source where the user is working" (selection markup /
+// formula source) — see the module doc
+pub use reveal::Reveal;
 // Host bridge + component: infeditor's composer keyboard path goes through
 // host_* (see the ui.rs notes)
 pub use geom::OverlayRect;

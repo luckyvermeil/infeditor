@@ -22,6 +22,10 @@ impl Editor {
         let last = self.doc.blocks.len().saturating_sub(1);
         let start = Pos::new(start.block.min(last), start.off);
         let end = Pos::new(end.block.min(last), end.off);
+        // A selection **inside** an atom's text (it is on screen, so it is text the
+        // user is editing) deletes those characters, not the whole atom. For a
+        // cross-block range the reveal never marks one.
+        let editing = self.reveal().editing_span(start.block);
         if start.block == end.block {
             let b = &mut self.doc.blocks[start.block];
             // Code blocks are plain text (including those inside a quote shell); edit the
@@ -36,7 +40,7 @@ impl Editor {
                 // delete_back/delete_forward already takes this path; selection deletion used
                 // to bypass it).
                 let mut inl = take_inlines(b);
-                Self::inlines_delete(&mut inl, &(start.off..end.off));
+                Self::inlines_delete(&mut inl, &(start.off..end.off), editing);
                 set_inlines(b, inl);
             }
             self.sel = Sel::caret(start);
@@ -59,7 +63,7 @@ impl Editor {
             b => {
                 let mut inl = take_inlines(b);
                 let block_len = b_plain(&inl).len();
-                Self::inlines_delete(&mut inl, &(start.off.min(block_len)..block_len));
+                Self::inlines_delete(&mut inl, &(start.off.min(block_len)..block_len), editing);
                 set_inlines(b, inl);
             }
         }
@@ -74,7 +78,7 @@ impl Editor {
             b => {
                 let mut inl = take_inlines(b);
                 let block_len = b_plain(&inl).len();
-                Self::inlines_delete(&mut inl, &(0..end.off.min(block_len)));
+                Self::inlines_delete(&mut inl, &(0..end.off.min(block_len)), editing);
                 inl
             }
         };
@@ -147,6 +151,10 @@ impl Editor {
             return self.delete_selection().is_some();
         }
         let p = self.sel.focus;
+        // The atom whose text is on screen (see [`crate::reveal`]): a delete inside
+        // it takes single characters, not the whole atom. Read before the mutable
+        // block borrow below.
+        let editing = self.reveal().editing_span(p.block);
         // Byte boundary of the previous character in the plain text
         if p.off > 0 {
             let Some(b) = self.doc.blocks.get_mut(p.block) else {
@@ -167,7 +175,7 @@ impl Editor {
             let plain = b_plain(&inl);
             let off = floor_boundary(&plain, p.off);
             let start = char_boundary_before(&plain, off);
-            Self::inlines_delete(&mut inl, &(start..off));
+            Self::inlines_delete(&mut inl, &(start..off), editing);
             set_inlines(b, inl);
             self.sel = Sel::caret(Pos::new(p.block, start));
             return true;
@@ -276,7 +284,7 @@ impl Editor {
                 // or the end of the previous block) and leaves the document alone — demoting
                 // the cell to a Para would tear the table shell and collapse the table into a
                 // ragged shape.
-                self.sel = Sel::caret(move_left(&self.doc, p));
+                self.sel = Sel::caret(move_left(&self.doc, p, editing));
                 false
             }
             // Backspace at the block start inside a quote shell peels one shell level off
@@ -358,6 +366,9 @@ impl Editor {
             return self.delete_selection().is_some();
         }
         let p = self.sel.focus;
+        // Same rule as delete_back: inside an atom whose text is on screen the
+        // delete takes single characters.
+        let editing = self.reveal().editing_span(p.block);
         let plain = self
             .doc
             .blocks
@@ -373,7 +384,7 @@ impl Editor {
                 text.replace_range(a..z, "");
             } else {
                 let mut inl = take_inlines(b);
-                Self::inlines_delete(&mut inl, &(off..end));
+                Self::inlines_delete(&mut inl, &(off..end), editing);
                 set_inlines(b, inl);
             }
             return true;
@@ -493,10 +504,14 @@ impl Editor {
             return self.delete_selection().is_some();
         }
         let focus = self.sel.focus;
+        // An atom being edited in place is ordinary text for word movement (its
+        // text is on screen, so the atom-skipping would jump over what the user is
+        // looking at).
+        let edit = self.reveal().editing_span(focus.block);
         let target = if back {
-            move_word_left(&self.doc, focus)
+            move_word_left(&self.doc, focus, edit)
         } else {
-            move_word_right(&self.doc, focus)
+            move_word_right(&self.doc, focus, edit)
         };
         if target == focus {
             return false;
