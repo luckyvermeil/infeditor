@@ -171,6 +171,7 @@ pub fn StatusBar() -> Element {
                 },
                 span { class: "sb-folder",
                     span { class: "sb-folder-tab" }
+                    span { class: "sb-folder-lid" }
                     span { class: "sb-folder-body" }
                 }
             }

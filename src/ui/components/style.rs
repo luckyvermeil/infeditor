@@ -219,15 +219,26 @@ pub fn stylesheet(t: &'static Theme) -> String {
 /* the current panel's toggle: accent (the same step VS Code uses for "enabled items") */
 .sb-btn.on {{ color:{accent}; }}
 .sb-btn.on:hover {{ background:{btn_hover}; color:{accent}; }}/* all icons are drawn with boxes; color follows the button's color (currentColor):
-   explorer = a folder (small tab + body), outline = three shrinking bars. */
-.sb-folder {{ position:relative; display:block; width:14px; height:11px; }}
+   explorer = a folder (tab + body as one silhouette), outline = three shrinking bars. */
+.sb-folder {{ position:relative; display:block; width:14px; height:10px; }}
+/* The tab is **open at the bottom** and the lid finishes the body's top edge to its
+   right, so the outline stays one continuous shape: the old tab was a closed box whose
+   bottom border ran *inside* the body, reading as two stacked boxes. `border-box` keeps
+   the strokes inside the 14×10 box (content-box made both parts ~3px larger and they
+   overlapped even more). */
 .sb-folder-tab {{
-    position:absolute; left:1px; top:1px; width:7px; height:4px;
-    border:1.4px solid currentColor; border-radius:2px;
+    position:absolute; left:0; top:0; width:6.5px; height:3.4px; box-sizing:border-box;
+    border:1.1px solid currentColor; border-bottom:0;
+    border-radius:1.2px 1.2px 0 0;
+}}
+.sb-folder-lid {{
+    position:absolute; left:6.5px; top:3.4px; width:7.5px; height:1.1px;
+    background:currentColor;
 }}
 .sb-folder-body {{
-    position:absolute; left:0; top:4px; width:14px; height:7px;
-    border:1.4px solid currentColor; border-radius:2px;
+    position:absolute; left:0; top:3.4px; width:14px; height:6.6px; box-sizing:border-box;
+    border:1.1px solid currentColor; border-top:0;
+    border-radius:0 0 1.2px 1.2px;
 }}
 .sb-bars {{ position:relative; display:block; width:14px; height:11px; }}
 .sb-bar {{ position:absolute; left:0; height:1.5px; border-radius:1px; background:currentColor; }}
