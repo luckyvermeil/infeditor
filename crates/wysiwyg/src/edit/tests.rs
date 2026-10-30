@@ -3238,6 +3238,27 @@ fn selected_markdown_inside_a_shown_atom_copies_the_source() {
     assert_eq!(e.selected_markdown(), "MG");
 }
 
+/// A drag that stops on a formula's front edge copies the text before it: the
+/// formula is an object there, so it is neither entered (no `$` in the clipboard)
+/// nor copied as a truncated node. This is the range `Geom::drag_pos_at` produces
+/// for a pointer anywhere over the formula's box.
+#[test]
+fn copying_up_to_a_formula_leaves_it_out() {
+    let mut e = ed("abc $x+y$ def");
+    // "abc " = 0..4, formula = 4..7; the caret sits on the formula's front edge.
+    e.sel = Sel {
+        anchor: Pos::new(0, 0),
+        focus: Pos::new(0, 4),
+    };
+    assert_eq!(e.reveal().editing_span(0), None, "not the formula's text");
+    let md = e.selected_markdown();
+    assert!(md.starts_with("abc"), "{md}");
+    assert!(!md.contains('$'), "the formula must not be entered: {md}");
+    // …and the delete takes the text only: the formula itself is untouched.
+    assert!(e.apply(Cmd::DeleteSelection));
+    assert_eq!(md::emit(&e.doc), "$x+y$ def\n", "{}", md::emit(&e.doc));
+}
+
 /// Copy must preserve Markdown structure (inline markup / tables / formulas)
 /// instead of flattening the selection into plain text.
 #[test]

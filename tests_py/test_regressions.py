@@ -2,7 +2,7 @@
 
 cargo-layer unit/integration regressions already exist (see the #[test]s in
 src/buffer/doc.rs, src/io/file.rs, src/ui/commands/csv.rs, etc.); this file
-only pins seven scenarios that go **through the full GUI pipeline**:
+only pins eight scenarios that go **through the full GUI pipeline**:
 
 1. Typing after a save must re-dirty the document (doc.rs hpos accounting
    fix — typing merged into an already-saved entry did not mark dirty, so
@@ -35,6 +35,13 @@ only pins seven scenarios that go **through the full GUI pipeline**:
    stop at the last header field, leaving a bare white strip without rules
    where the body below shows a grid). oracle = pixel colour of the same blank
    column in the header row vs the body row.
+8. A pointer drag across an inline formula must keep the caret on the formula's
+   **front edge**, not walk back mid-formula. A typeset formula is an SVG with
+   no text node, so the text hit-test answered with a neighbouring text's edge
+   and flipped between the two sides as the pointer crossed the box
+   (`Geom::drag_pos_at` answers the whole box with the front edge; the carrier's
+   box spans the line band, so the ink's margins are included too).
+   oracle = the copied selection: no `$` while the pointer is over it.
 
 Clicking a self-drawn control: geometry is the **only** source, and every
 geometric click has to prove it landed (see `_click_toolbar_button`). accesskit
@@ -557,3 +564,70 @@ def test_csv_header_band_covers_blank_columns(app_factory, work_dir):
         f"(mean_diff={band_vs_body:.1f}) — the header cell is missing and the "
         "canvas shows through"
     )
+
+
+# ---- 8. A drag across an inline formula keeps the caret before it ------------
+
+
+def test_wys_drag_across_a_formula_stops_before_it(app_factory, work_dir):
+    """A pointer drag that enters a **typeset formula** keeps the caret on the
+    formula's front edge — right after the last thing before it — instead of
+    jumping into or behind the formula.
+
+    Regression: a typeset formula is an `<svg>` with no text node, so the text
+    hit-test answered with the *preceding* text node and a byte near its start —
+    the caret jumped back into "abc " and then crawled forward again while the
+    pointer crossed the formula's box ("拖动到公式中间时光标回退").
+    `Geom::drag_pos_at` now answers any point over a typeset formula's box with
+    its front edge; the box never changes shape (the atom stays typeset), so the
+    answer cannot oscillate.
+
+    Oracle: the copied selection. Sweeping the pointer right along one line, the
+    selection may only **grow** (it is a prefix chain), and every sample taken
+    while the pointer is over the formula's box must be the same one — the caret
+    sits on the box's front edge, whatever pixel of the box the pointer is on.
+    """
+    body = "abc $x+y$ def\n"
+    f = work_dir / "drag-formula.md"
+    f.write_text(body, encoding="utf-8")
+    a = app_factory(files=[f])
+    assert a.wait_title("drag-formula.md")
+    _enter_wys(a)
+    time.sleep(0.3)
+
+    # First row: content top 96 + 16 padding + half of the 24px row. The formula
+    # sits between "abc " and " def" — its box spans ≈x 49..85 at the default
+    # 15px body font, so samples 3..6 (54..78) are inside it and 86.. are past it.
+    y = 124.0
+    xs = list(range(30, 111, 8))
+    sels: list[str] = []
+    for x in xs:
+        # A previous selection's floating toolbar sits above the line and would
+        # swallow this press: an empty click first dismisses it.
+        a.click_at_css(700.0, 260.0)
+        time.sleep(0.22)
+        a.drag_at_css(26.0, y, float(x), y, steps=14)
+        time.sleep(0.22)
+        # `copy_selection` returns "" for a collapsed selection (it raises only
+        # when the keys never reached the app, which must fail the test, not be
+        # recorded as an empty sample). The writer escapes a trailing space as
+        # `&#32;`; compare like with like.
+        sels.append(a.copy_selection().replace("&#32;", " "))
+
+    for prev, nxt, px, nx in zip(sels, sels[1:], xs, xs[1:]):
+        assert nxt.startswith(prev), (
+            f"dragging right from x={px} to x={nx} shrank the selection "
+            f"{prev!r} -> {nxt!r}: the caret walked back over the formula"
+        )
+    inside = sels[3:7]
+    assert len(set(inside)) == 1, (
+        f"the selection changes while the pointer is inside the formula's box: "
+        f"{inside!r} — the caret must stay on the box's front edge"
+    )
+    assert inside[0] and "$" not in inside[0], (
+        f"the selection {inside[0]!r} does not stop before the formula"
+    )
+    assert "$" in sels[-1], (
+        f"x={xs[-1]} is past the formula, so the selection must include it: {sels[-1]!r}"
+    )
+    assert f.read_text(encoding="utf-8") == body, "the drags must not edit the document"

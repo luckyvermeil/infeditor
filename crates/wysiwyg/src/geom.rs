@@ -182,6 +182,12 @@ impl Geom {
         let doc = self.handle.try_doc()?;
         let (dx, dy) = client_to_content(&doc, self.handle.node_id(), x, y);
         let container = fragment_container(&doc, self.handle.node_id());
+        // A point **over a typeset formula's box** is answered by the atom itself:
+        // the box has no text, and the nearest-text rule flips between the texts on
+        // either side of it as the pointer crosses (`math_front_at`).
+        if let Some(p) = Self::math_front_at(&doc, model, container, dx, dy) {
+            return Some(p);
+        }
         // Candidates: caret-addressable blocks, keyed by (vertical distance,
         // horizontal distance) — containment on both axes wins over "near in y".
         let hit = crate::dom_index::with_index(&doc, container, |idx| {
@@ -331,20 +337,13 @@ impl Geom {
                     let Some(&(start, end)) = spans.get(ordinal) else {
                         continue;
                     };
-                    // A formula whose **source is shown** is ordinary text: the
-                    // click must land on the character under the pointer, not snap
-                    // to the formula's edges (that is the whole point of expanding
-                    // it). Its `<span data-math data-math-src>` carries real text,
-                    // so `pos_at` handles it.
-                    if doc
-                        .get_node(nid)
-                        .and_then(|n| {
-                            n.data
-                                .downcast_element()
-                                .map(|el| attr_str(el, "data-math-src").is_some())
-                        })
-                        .unwrap_or(false)
-                    {
+                    // Only a **typeset** formula is an object. A formula whose
+                    // source is shown (`data-math-src`) and one that failed to
+                    // typeset (`<code data-math>`, no `data-vlen`) carry real text:
+                    // the click must land on the character under the pointer, not
+                    // snap to the formula's edges — that is the whole point of
+                    // expanding it, and `pos_at` is exact there.
+                    if !math_is_atom(&doc, nid) {
                         continue;
                     }
                     let Some((x0, y0, w, h)) = math_rect(&doc, nid) else {
@@ -355,6 +354,86 @@ impl Geom {
                     {
                         return Some(Pos::new(bid, if dx < x0 + w / 2.0 { start } else { end }));
                     }
+                }
+            }
+            None
+        })
+    }
+
+    /// Drag-time mapping over a **typeset formula**: a point over its box — the
+    /// carrier's box spans the whole line, not just the ink — → the caret just
+    /// **before** the formula (its front edge).
+    ///
+    /// The box holds no text (the glyphs are an SVG), so `find_text_position`
+    /// answers with a *neighbouring* text's edge — and which neighbour wins flips
+    /// as the pointer crosses the box. That is the "the caret walks back while I
+    /// drag across a formula" report: coming from the right the caret sat past the
+    /// formula, and one step into its box it jumped back in front of it.
+    ///
+    /// A formula is an object: it takes no caret of its own, so while the pointer
+    /// is anywhere over it the caret stays after the last thing **before** it, and
+    /// only crossing the box's far edge moves it past. The box never changes shape
+    /// (the atom stays typeset), so the answer cannot oscillate — the same property
+    /// the row-band mapping gives tables.
+    ///
+    /// A formula **shown as source** (and one that failed to typeset: `<code
+    /// data-math>`) holds real text and is left to `pos_at`, and an atom that
+    /// covers its whole block (a display formula) is left to the band clamp, which
+    /// already answers its start/end by half.
+    fn math_front_at(
+        doc: &BaseDocument,
+        model: &Doc,
+        container: blitz_dom::NodeId,
+        dx: f32,
+        dy: f32,
+    ) -> Option<Pos> {
+        // A click is a hot path, and so is every pointer move: no formula in the
+        // document means no walk.
+        if !model.blocks.iter().any(Block::has_math) {
+            return None;
+        }
+        crate::dom_index::with_index(doc, container, |idx| {
+            for (_, bid) in idx.order() {
+                let Some(nodes) = idx.math(bid) else { continue };
+                for (ordinal, &nid) in nodes.iter().enumerate() {
+                    // Geometry first: only a formula whose box holds the pointer
+                    // gets its spans built (a drag move sweeps every formula in
+                    // the document, and `math_spans` allocates).
+                    let Some((x0, y0, w, h)) = math_rect(doc, nid) else {
+                        continue;
+                    };
+                    // The hit box is the **carrier's**, not the SVG's: an inline
+                    // element's layout box carries the line's height (measured: a
+                    // 15px `x+y` inks ~12px inside a ~24px box, ±6px of margin
+                    // still hits), so a pointer a few pixels above/below the glyphs
+                    // lands here too.
+                    if w <= 0.0 || dx < x0 || dx > x0 + w || dy < y0 || dy > y0 + h {
+                        continue;
+                    }
+                    // Only a typeset formula is an object: it holds no text, so
+                    // the whole box answers with one position. A formula shown as
+                    // source (`data-math-src`) and one that failed to typeset
+                    // (`<code data-math>`) are real text — left to `pos_at`, and
+                    // not an answer that ends the scan: a later formula may follow.
+                    if !math_is_atom(doc, nid) {
+                        continue;
+                    }
+                    let Some(b) = model.blocks.get(bid) else {
+                        continue;
+                    };
+                    let Some(&(start, end)) = b.math_spans().get(ordinal) else {
+                        continue;
+                    };
+                    if end <= start {
+                        continue;
+                    }
+                    // A display formula is its block: the band clamp below already
+                    // answers its start/end by half, and those are the only two
+                    // positions the block has.
+                    if start == 0 && end >= b.plain_len() {
+                        continue;
+                    }
+                    return Some(Pos::new(bid, start));
                 }
             }
             None
@@ -803,6 +882,17 @@ fn math_rect(doc: &BaseDocument, nid: blitz_dom::NodeId) -> Option<(f32, f32, f3
     }
     let (x, y) = doc_position(doc, sid);
     Some((x, y, lay.size.width, lay.size.height))
+}
+
+/// Whether a `data-math` node is a **typeset atom**: the carrier span written by
+/// [`crate::render`] for a formula that rendered (`data-vlen`, no text of its
+/// own). The source form (`data-math-src`) and the failed-parse `<code
+/// data-math>` fallback hold real text, so the formula hit-tests must stand aside
+/// for them and let the text mapping answer.
+fn math_is_atom(doc: &BaseDocument, nid: blitz_dom::NodeId) -> bool {
+    doc.get_node(nid)
+        .and_then(|n| n.data.downcast_element().and_then(atomic_vlen))
+        .is_some()
 }
 
 /// Whether a model block type can accept the caret: `Hr` is a text-less shell
@@ -1347,8 +1437,14 @@ fn walk_l2p(
     match &node.data {
         blitz_dom::NodeData::Text(t) => {
             let len = t.content.len();
+            // `byte` may be *past* this text — `usize::MAX` is the "block end"
+            // query the diagnostics use — and `acc_plain + (byte - acc_layout)`
+            // wrapped there (a debug-build panic inside the log path, which is
+            // exactly when someone is trying to debug something else). The offset
+            // only means anything when the byte lands in this node anyway.
+            let within = byte.saturating_sub(*acc_layout).min(len);
             let hit = *acc_layout + len >= byte;
-            let p = *acc_plain + (byte - *acc_layout);
+            let p = *acc_plain + within;
             *acc_plain += len;
             *acc_layout += len;
             if hit {
@@ -1945,6 +2041,52 @@ mod tests {
         assert_eq!(layout_to_plain(&doc, block, 3), Some(6));
         // …and the caret inside the atom's range snaps to its front edge.
         assert_eq!(plain_to_layout(&doc, block, 4), Some(2));
+    }
+
+    /// The formula hit-tests must answer only for a **typeset** carrier. The
+    /// source span and the failed-parse `<code>` fallback hold real text, so
+    /// `math_is_atom` says no and the text mapping places the caret on the exact
+    /// character instead of snapping to the formula's edges.
+    #[test]
+    fn only_a_typeset_formula_is_an_atom() {
+        let (doc, block) = block_doc(|m| {
+            let atom = m.create_element(
+                qname("span"),
+                vec![attr("data-math", ""), attr("data-vlen", "3")],
+            );
+            let src = m.create_element(
+                qname("span"),
+                vec![attr("data-math", ""), attr("data-math-src", "")],
+            );
+            let fallback = m.create_element(qname("code"), vec![attr("data-math", "")]);
+            vec![atom, src, fallback]
+        });
+        let kids = doc.get_node(block).expect("block").children.clone();
+        assert!(math_is_atom(&doc, kids[0]), "typeset carrier is an atom");
+        assert!(!math_is_atom(&doc, kids[1]), "source on screen is text");
+        assert!(!math_is_atom(&doc, kids[2]), "parse fallback is text");
+    }
+
+    /// `usize::MAX` is the "block end" query (`ui`'s resync diagnostic asks it):
+    /// it must answer the block's plain length. The text branch computed
+    /// `acc_plain + (byte - acc_layout)` *before* the hit test, so `MAX` wrapped
+    /// the addition and the debug build panicked — inside the very log path
+    /// someone uses to debug.
+    #[test]
+    fn the_block_end_query_does_not_overflow() {
+        let (doc, block) = block_doc(|m| {
+            let a = m.create_text_node("ab");
+            let atom = m.create_element(
+                qname("span"),
+                vec![attr("data-math", ""), attr("data-vlen", "3")],
+            );
+            let b = m.create_text_node("cd");
+            vec![a, atom, b]
+        });
+        assert_eq!(block_plain_len(&doc, block), 7);
+        assert_eq!(layout_to_plain(&doc, block, usize::MAX), Some(7));
+        // Any byte past the text is the same answer, not a panic.
+        assert_eq!(layout_to_plain(&doc, block, 99), Some(7));
     }
 
     /// Headlessly construct a parley layout (same engine as blitz's inline
