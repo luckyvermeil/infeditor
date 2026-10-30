@@ -195,8 +195,12 @@ fn MenuCaption(
     // Tri-state in the `.mi` / `.mi.open` classes (components::style): an open caption stays
     // highlighted even with the pointer away — the `:open` class is exactly this "keep it on
     // while the pointer is elsewhere" state.
-    // Geometry (padding/flex/nowrap/user-select) lives in the `.mi` class
-    let style = "";
+    // Geometry (padding/flex/nowrap/user-select) lives in the `.mi` class; the **color is
+    // inline** so a theme switch mutates this element: a class-only color change restyles
+    // the node but blitz's paint keeps the old glyph color until something else dirties it
+    // (regression: after switching dark→light in the preferences window, the captions stayed
+    // in the dark theme's `#c9d1d9` until they were hovered).
+    let style = format!("color:{};", t.menu_fg);
     let underline_style = format!(
         "position:absolute; left:0; bottom:0; width:100%; height:2px; background:{};",
         t.accent
@@ -272,10 +276,16 @@ pub fn hwnd() -> isize {
 /// same level as an ordinary dropdown, dodging the title bar's stacking context).
 #[component]
 fn MoreBtn(state: Signal<EditorState>) -> Element {
-    // Colors live in the `.mi` / `.mi.open` classes (components::style)
-    let is_open = state.read().menu.more_open;
-    let style =
-        format!("width:{MORE_W}px; justify-content:center; font-size:13px; letter-spacing:-2px;");
+    // Colors live in the `.mi` / `.mi.open` classes (components::style); the caption color is
+    // inline for the same reason as `MenuCaption` (a theme switch must mutate the node).
+    let (is_open, fg) = {
+        let st = state.read();
+        (st.menu.more_open, st.theme().menu_fg)
+    };
+    let style = format!(
+        "width:{MORE_W}px; justify-content:center; font-size:13px; letter-spacing:-2px; \
+         color:{fg};"
+    );
     rsx! {
         div {
             class: if is_open { "mi open" } else { "mi" },

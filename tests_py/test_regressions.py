@@ -2,7 +2,7 @@
 
 cargo-layer unit/integration regressions already exist (see the #[test]s in
 src/buffer/doc.rs, src/io/file.rs, src/ui/commands/csv.rs, etc.); this file
-only pins eight scenarios that go **through the full GUI pipeline**:
+only pins nine scenarios that go **through the full GUI pipeline**:
 
 1. Typing after a save must re-dirty the document (doc.rs hpos accounting
    fix — typing merged into an already-saved entry did not mark dirty, so
@@ -42,6 +42,12 @@ only pins eight scenarios that go **through the full GUI pipeline**:
    (`Geom::drag_pos_at` answers the whole box with the front edge; the carrier's
    box spans the line band, so the ink's margins are included too).
    oracle = the copied selection: no `$` while the pointer is over it.
+9. Switching dark→light from the **preferences window** must repaint the menu
+   captions: their colour is inline now, so the theme flip mutates the caption
+   nodes. A class-only colour is restyled but blitz keeps painting the cached
+   glyph runs — the captions stayed in the dark theme's `#c9d1d9` until they
+   were hovered. oracle = pixel luminance of the caption row (dark text on the
+   light bar), with no hover in between.
 
 Clicking a self-drawn control: geometry is the **only** source, and every
 geometric click has to prove it landed (see `_click_toolbar_button`). accesskit
@@ -57,7 +63,7 @@ from __future__ import annotations
 
 import time
 
-from infed.driver import mean_diff
+from infed.driver import mean_diff, user32, window_title, windows_of_pid, wt
 
 # ---- Geometry (CSS px, same constants as toolbar::layout / csvtable.rs) -----
 
@@ -631,3 +637,71 @@ def test_wys_drag_across_a_formula_stops_before_it(app_factory, work_dir):
         f"x={xs[-1]} is past the formula, so the selection must include it: {sels[-1]!r}"
     )
     assert f.read_text(encoding="utf-8") == body, "the drags must not edit the document"
+
+
+# ---- 9. A theme switch from Preferences repaints the menu captions ----------
+
+
+def test_theme_switch_from_preferences_repaints_menu_captions(app_factory, work_dir):
+    """Switching dark→light in the **preferences window** must leave the menu
+    captions readable without hovering them.
+
+    Regression: the caption colour came only from the `.mi` class. The theme
+    flip rewrites the `<style>` sheet and the captions are restyled, but blitz's
+    paint keeps the cached glyph runs — the row stayed in the dark theme's
+    `#c9d1d9` until a hover changed the caption's class and forced a repaint.
+    The caption colour is now **inline** (`t.menu_fg`), so the theme flip mutates
+    the node itself and the glyphs are painted with the new colour.
+
+    The View menu is used for the first hop (light→dark) because its open/close
+    classes dirty the captions anyway; the second hop goes through Preferences,
+    which is where the stale colour was reported.
+    """
+    a = app_factory()
+    time.sleep(0.6)
+    # Caption row: right of the app icon, vertically centred in the 36px bar.
+    box = (45.0, 8.0, 330.0, 28.0)
+
+    def darkest() -> int:
+        # #333 text → ~51, the stale dark-theme #c9d1d9 → ~201.
+        return a.snapshot(box).convert("L").getextrema()[0]
+
+    assert darkest() < 110, "the light theme's captions must start dark"
+
+    # View → first row toggles the theme (light → dark).
+    a.keys("alt")
+    time.sleep(0.25)
+    a.keys("v")
+    time.sleep(0.35)
+    a.keys("enter")
+    time.sleep(0.9)
+    assert _uia_has(a, "主题: 深色", timeout=3.0), "the theme did not switch to dark"
+
+    # Settings → Preferences… (third row): Alt, t, Down ×2, Enter.
+    a.keys("alt")
+    time.sleep(0.25)
+    a.keys("t")
+    time.sleep(0.35)
+    a.keys("down")
+    time.sleep(0.15)
+    a.keys("down")
+    time.sleep(0.15)
+    a.keys("enter")
+    time.sleep(1.2)
+
+    popup = [h for h in windows_of_pid(a.proc.pid)
+             if h != a.main_hwnd and window_title(h)]
+    assert popup, "the preferences window did not open"
+    pop = popup[0]
+    # "深色主题(T)" checkbox: measured at (158, 44) in the popup's client area.
+    a.click_in_window(pop, 158.0, 44.0)
+    time.sleep(0.9)
+    assert _uia_has(a, "主题: 浅色", timeout=4.0), "the theme did not switch back to light"
+    # Close the popup (WM_CLOSE, the shell's own close path).
+    user32.PostMessageW(wt.HWND(pop), 0x0010, 0, 0)
+    time.sleep(0.8)
+
+    assert darkest() < 120, (
+        "the menu captions are still in the dark theme's colour after switching "
+        "back to light — they only repaint once hovered"
+    )
