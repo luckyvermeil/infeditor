@@ -172,7 +172,7 @@ impl Geom {
     /// means "end of the block" — the same answer in both shapes, so the sweep can
     /// not oscillate.
     ///
-    /// A table is one unit at its **outer edges** (see [`table_edge_pos`]): a point
+    /// A table is one unit at its **outer edges** (see `table_edge_pos`): a point
     /// past the top/bottom of the table belongs to the table as a whole — its first
     /// cell's start / last cell's end — whatever column the pointer is over. The
     /// per-cell band would otherwise stop the sweep at the cell under the pointer's
@@ -574,7 +574,7 @@ impl Geom {
     /// The caret rect of a **selection's focus**.
     ///
     /// A range paints the block's layout edge when it reaches the block's
-    /// first/last plain byte (see [`selection_layout_span`]) — the virtual source
+    /// first/last plain byte (see `selection_layout_span`) — the virtual source
     /// markers at that edge are part of the copied text. The focus caret must sit
     /// on the **same** edge: a selection ending at a table's last cell showed the
     /// highlight past the trailing ` |` while the caret bar stopped in front of
