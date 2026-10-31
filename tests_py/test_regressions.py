@@ -2,7 +2,7 @@
 
 cargo-layer unit/integration regressions already exist (see the #[test]s in
 src/buffer/doc.rs, src/io/file.rs, src/ui/commands/csv.rs, etc.); this file
-only pins nine scenarios that go **through the full GUI pipeline**:
+only pins ten scenarios that go **through the full GUI pipeline**:
 
 1. Typing after a save must re-dirty the document (doc.rs hpos accounting
    fix — typing merged into an already-saved entry did not mark dirty, so
@@ -48,6 +48,13 @@ only pins nine scenarios that go **through the full GUI pipeline**:
    glyph runs — the captions stayed in the dark theme's `#c9d1d9` until they
    were hovered. oracle = pixel luminance of the caption row (dark text on the
    light bar), with no hover in between.
+10. A `$$…$$` that shares its source line with text must still take a line of
+   its own **without** tearing the paragraph's inline layout apart: as a
+   `display:block` box it split the block into an anonymous text block + the
+   formula, so ↓ from the text line collapsed the caret back to the paragraph
+   start (and clicks/arrows in a wrapped line mapped into the formula). The
+   carrier is a full-width `inline-block` now. oracle = where a typed marker
+   lands after ↓ from the document start (inside the text, not at offset 0).
 
 Clicking a self-drawn control: geometry is the **only** source, and every
 geometric click has to prove it landed (see `_click_toolbar_button`). accesskit
@@ -734,4 +741,61 @@ def test_theme_switch_from_preferences_repaints_menu_captions(app_factory, work_
     assert darkest() < 120, (
         "the menu captions are still in the dark theme's colour after switching "
         "back to light — they only repaint once hovered"
+    )
+
+
+# ---- 10. A display formula after text keeps the paragraph's caret ----------
+
+MATH_AFTER_TEXT = (
+    r"$$\left{\begin{array}{l}x_n^{\frac{4 n+5}{n}}+3 x_n+y_n=1+\frac{1}{n} \ "
+    r"y_n^{\frac{n+2}{n}}+4 x_n+3 y_n=4-\frac{1}{n}\end{array}\right.$$"
+)
+
+
+def test_display_math_after_text_keeps_the_paragraph_caret(app_factory, work_dir):
+    """A `$$…$$` sharing its source line with text must not swallow the caret.
+
+    The formula still renders on a line of its own, but its carrier is a
+    full-width **inline-block** now. As a `display:block` box it split the
+    paragraph into an anonymous text block plus the formula: the block's inline
+    layout no longer covered the atom, ↓ from the first text line collapsed the
+    caret to the paragraph start (typed text landed at offset 0 — "the caret
+    cannot be placed in the text before the formula"), and clicks/arrows on a
+    wrapped line mapped into the formula.
+    """
+    text = ("aaaa " * 100).strip()
+    body = text + " " + MATH_AFTER_TEXT + "\n"
+    f = work_dir / "math-after-text.md"
+    f.write_text(body, encoding="utf-8")
+    a = app_factory(files=[f])
+    time.sleep(0.6)
+
+    # Word wrap on (View → 自动换行): rows 0 theme, 1..3 zoom, 4 highlight,
+    # 5 highlight-all, 6 wrap; separators are skipped by the cursor.
+    a.keys("alt")
+    time.sleep(0.25)
+    a.keys("v")
+    time.sleep(0.35)
+    for _ in range(6):
+        a.keys("down")
+        time.sleep(0.1)
+    a.keys("enter")
+    time.sleep(0.8)
+    assert _uia_has(a, "自动换行: 开", timeout=3.0), "word wrap did not turn on"
+
+    # ↓ from the document start must land on the paragraph's **second visual
+    # line**, i.e. inside the text — not at offset 0.
+    a.keys("ctrl+home")
+    time.sleep(0.3)
+    a.keys("down")
+    time.sleep(0.4)
+    a.type_text("Z", click=False, focus=False)
+    time.sleep(0.4)
+    a.keys("ctrl+s")
+    time.sleep(0.7)
+    got = f.read_text(encoding="utf-8")
+    z = got.find("Z")
+    assert 0 < z < len(text), (
+        f"↓ from the document start put the caret outside the text (Z at {z}): "
+        "the display formula split the paragraph's inline layout"
     )
