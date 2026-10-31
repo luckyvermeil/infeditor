@@ -331,10 +331,10 @@ def test_caret_in_list_items(app_factory, work_dir):
 
     _caret_case(app_factory, work_dir, body, act, exp, "listcaret")
 
-# ---- 3. Formulas: atomic caret / deletion / click / display / invalid fallback ----
+# ---- 3. Formulas: caret / deletion / click / display / invalid fallback ----
 
 
-def test_inline_math_atom_caret_and_delete(app_factory, work_dir):
+def test_inline_math_source_at_caret(app_factory, work_dir):
     """A formula at the caret shows its LaTeX and is edited character by
     character; a typed character at its **edge** still belongs to the line.
 
@@ -379,7 +379,35 @@ def test_inline_math_atom_caret_and_delete(app_factory, work_dir):
     assert "$E=mc^2$" in d and "$E2=" not in d, d
 
 
-def test_inline_math_mouse_click_never_enters_source(app_factory, work_dir):
+def test_formula_selection_deletes_whole_node(app_factory, work_dir):
+    """A selection that **covers** the formula takes it whole. Deleting the
+    source character by character (the in-place editing path) is right *inside*
+    the atom, but a range over the object must not leave a truncated `$E=mc$`
+    behind — any `$` left in the file is a failed delete."""
+    body = "前 $E=mc^2$ 后\n"
+    f = _scene(work_dir, body, "math-del.md")
+    a = _open(app_factory, f)
+
+    # Two steps put the caret on the formula's front edge; shift+End covers the
+    # formula and the rest of the line, so Delete takes the node whole.
+    a.keys("ctrl+home")
+    a.keys("right")
+    a.keys("right")
+    a.keys("shift+end")
+    a.keys("delete")
+    time.sleep(0.5)
+    _save_if_dirty(a)
+    d = _disk(f)
+    assert "$" not in d, f"the formula was split instead of taken whole: {d!r}"
+    # The line keeps its leading "前 " — the trailing space is entity-escaped by
+    # the writer (it must survive a round trip), so compare like with like.
+    assert d.replace("&#32;", " ") == "前 \n", d
+
+
+def test_inline_math_click_types_beside_it(app_factory, work_dir):
+    """A click on a formula puts the caret on its edge (its source is shown
+    there); a character typed at that edge belongs to the line — the formula is
+    never split into `$E=mc$` + `^2$`."""
     body = "前 $E=mc^2$ 后\n"
     f = _scene(work_dir, body, "math-click.md")
     a = _open(app_factory, f)
@@ -389,7 +417,8 @@ def test_inline_math_mouse_click_never_enters_source(app_factory, work_dir):
     time.sleep(0.5)
     _save_if_dirty(a)
     d = _disk(f)
-    # Clicked on the atom: the caret snaps to the atom boundary; the formula source must not be split
+    # Clicked on the atom: the caret snaps to the atom boundary; a character
+    # typed there goes beside the formula (the atom is never split).
     assert "$E=mc^2$" in d, d
     assert d.replace("Q", "") == body, f"formula was split open: {d!r}"
 
