@@ -63,6 +63,17 @@ const DRAG_SLOP: f32 = 2.0;
 /// apart and unaffected.
 const TRIPLE_DIST: f32 = 8.0;
 
+/// Is the primary button held **after a press that landed in this component**?
+///
+/// `held_buttons` alone is not enough for the drag handler: a press on the
+/// scrollbar, the toolbar or a floating panel and then a move over the content
+/// carries the primary button too, and the editor would collapse its selection
+/// under a pointer whose press it never saw (the press coordinate it keeps is
+/// from the previous gesture — or the initial `(0,0)`). Set on the press, cleared
+/// on the release, including the window-level release a pointer that left the
+/// element produces (`host_drag_end`).
+static PRESSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Overlay state (content coordinates relative to `.wys-root`): caret + focused
 /// cell highlight.
 ///
@@ -1019,6 +1030,10 @@ pub fn Wysiwyg(
                     ed.sel = Sel::caret(p);
                     ed.h_pos = None; // A click rebuilds the vertical column memory
                 }
+                // A press that placed the caret owns the pointer until it is
+                // released (a checkbox/link press returned above — its drag is not
+                // a selection drag).
+                PRESSING.store(true, std::sync::atomic::Ordering::Relaxed);
                 ctx.sync_overlays(&g);
                 ctx.focus_root();
                 // A press landed in the content: the host starts tracking the
@@ -1043,7 +1058,12 @@ pub fn Wysiwyg(
                 // Extend the selection while the button is held. Every move is mapped
                 // through `pos_at` against the *current* layout, so a block that
                 // expands under the pointer cannot leave a dangling anchor behind.
-                if !evt.data.held_buttons().contains(MouseButton::Primary) {
+                if !evt.data.held_buttons().contains(MouseButton::Primary)
+                    || !PRESSING.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    // A press that did not land here (a scrollbar, the toolbar, a
+                    // floating panel) is not our drag, however far the pointer
+                    // travels over the content.
                     return;
                 }
                 let (_, px, py, _) = *clicks.read();
@@ -1069,6 +1089,7 @@ pub fn Wysiwyg(
                 ctx.drag_to(p);
             },
             onpointerup: move |_evt: PointerEvent| {
+                PRESSING.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(cb) = on_drag.as_ref() {
                     cb.call(false);
                 }
@@ -1738,6 +1759,10 @@ pub fn host_drag_end(
     editor: &mut Signal<Editor>,
     overlays: &mut Signal<Overlays>,
 ) -> bool {
+    // The release ends the press even when nothing moved (a click whose pointerup
+    // went elsewhere): a later drag from outside the component must not be taken
+    // for a selection drag.
+    PRESSING.store(false, std::sync::atomic::Ordering::Relaxed);
     let was_dragging = editor.read().dragging;
     if !was_dragging {
         return false;

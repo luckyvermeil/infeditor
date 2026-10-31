@@ -302,6 +302,24 @@ impl Block {
         out
     }
 
+    /// Plain-byte range of the **display** formula (`$$…$$`) that contains `off`,
+    /// if there is one (no allocation; the caret trigger's one exception needs to
+    /// tell a display formula from an inline one at the same offsets).
+    pub fn display_math_span_at(&self, off: usize) -> Option<(usize, usize)> {
+        let mut acc = 0usize;
+        let mut out = None;
+        match self {
+            Block::Para(i)
+            | Block::Head { inlines: i, .. }
+            | Block::Li { inlines: i, .. }
+            | Block::Quote(i)
+            | Block::Td { inlines: i, .. } => walk_display_math_at(i, &mut acc, off, &mut out),
+            Block::Quoted { inner, .. } => return inner.display_math_span_at(off),
+            Block::Code { .. } | Block::Html { .. } | Block::Hr => {}
+        }
+        out
+    }
+
     /// Plain-byte ranges of the **image alts** in a block (same walk and
     /// coordinate system as [`Block::math_spans`]). Allocates nothing when the
     /// block has no image.
@@ -388,6 +406,35 @@ fn walk_math_spans(inl: &[Inline], acc: &mut usize, out: &mut Vec<(usize, usize)
             | Inline::Em(c)
             | Inline::Del(c)
             | Inline::Link { inlines: c, .. } => walk_math_spans(c, acc, out),
+            other => *acc += other.plain_len(),
+        }
+    }
+}
+
+/// Same walk as [`walk_math_spans`], collecting only the **display** formula that
+/// contains `off` (short-circuits; no allocation).
+fn walk_display_math_at(
+    inl: &[Inline],
+    acc: &mut usize,
+    off: usize,
+    out: &mut Option<(usize, usize)>,
+) {
+    for i in inl {
+        match i {
+            Inline::Math { src, display: true } if *acc <= off && off <= *acc + src.len() => {
+                *out = Some((*acc, *acc + src.len()));
+                return;
+            }
+            Inline::Math { src, .. } => *acc += src.len(),
+            Inline::Strong(c)
+            | Inline::Em(c)
+            | Inline::Del(c)
+            | Inline::Link { inlines: c, .. } => {
+                walk_display_math_at(c, acc, off, out);
+                if out.is_some() {
+                    return;
+                }
+            }
             other => *acc += other.plain_len(),
         }
     }

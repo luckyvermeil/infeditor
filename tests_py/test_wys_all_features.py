@@ -335,33 +335,48 @@ def test_caret_in_list_items(app_factory, work_dir):
 
 
 def test_inline_math_atom_caret_and_delete(app_factory, work_dir):
+    """A formula at the caret shows its LaTeX and is edited character by
+    character; a typed character at its **edge** still belongs to the line.
+
+    Contract (in-place source expansion): the caret expands the formula it sits
+    in or right next to, so the arrow keys walk the **visible source** instead of
+    stepping over it — two steps from the block start put the caret on the
+    formula's front edge (`$|E=mc^2$`), the next one inside it (`$E|…`). Typing
+    at the edge prepends to the line (the formula is never split open), and a
+    character typed inside the source edits the LaTeX in place: one formula in,
+    one formula out.
+    """
     body = "前 $E=mc^2$ 后\n"
     f = _scene(work_dir, body, "math-atom.md")
     a = _open(app_factory, f)
 
-    # -> crosses the formula in whole steps: after 3 steps (before / space /
-    # formula) typing should land **after** the formula
+    # 2 steps: after 前 (0..3), then the formula's front edge (4). Its source is
+    # on screen there, so the character goes in front of the `$` — the LaTeX
+    # itself is untouched (the edge belongs to the surrounding text).
     a.keys("ctrl+home")
-    for _ in range(3):
+    for _ in range(2):
         a.keys("right")
     a.type_text("1", click=False, focus=False)
     time.sleep(0.5)
     _save_if_dirty(a)
-    assert _disk(f) == "前 $E=mc^2$1 后\n", _disk(f)
+    assert _disk(f) == "前 1$E=mc^2$ 后\n", _disk(f)
 
-    # Backspace deletes the 1; another backspace at the formula's end -> the whole
-    # formula node is deleted (no half a src left behind)
+    # Drop the 1 and step once more: the caret is inside the visible source, so
+    # typing edits the LaTeX in place instead of splitting the node.
     a.keys("backspace")
-    a.keys("backspace")
+    a.keys("right")
+    a.type_text("2", click=False, focus=False)
     time.sleep(0.5)
     _save_if_dirty(a)
-    assert _disk(f) == "前  后\n", _disk(f)
+    assert _disk(f) == "前 $E2=mc^2$ 后\n", _disk(f)
 
-    # Undo restores the formula (whole node)
+    # Undo takes the edit back; the formula is still one whole node (the undo
+    # granularity is not the point here — only that no `$E…$` half survives).
     a.keys("ctrl+z")
     time.sleep(0.6)
     _save_if_dirty(a)
-    assert "$E=mc^2$" in _disk(f), _disk(f)
+    d = _disk(f)
+    assert "$E=mc^2$" in d and "$E2=" not in d, d
 
 
 def test_inline_math_mouse_click_never_enters_source(app_factory, work_dir):
@@ -384,10 +399,14 @@ def test_image_atom_delete_whole(app_factory, work_dir):
     f = _scene(work_dir, body, "img-atom.md")
     a = _open(app_factory, f)
 
-    # before(3) space(4) formula->10 space->11 after->14 space->15 image->18 (-> skips whole)
-    a.keys("ctrl+home")
-    for _ in range(7):
-        a.keys("right")
+    # From the document end: one step lands before 尾, the next steps over the
+    # **whole image** (its source is not on screen, so it is one atom) to its
+    # front edge; -> then answers its end, where Backspace takes the image whole
+    # instead of eating one alt character.
+    a.keys("ctrl+end")
+    a.keys("left")
+    a.keys("left")
+    a.keys("right")
     a.keys("backspace")
     time.sleep(0.5)
     _save_if_dirty(a)

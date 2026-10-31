@@ -2095,26 +2095,37 @@ mod tests {
         assert!(!html.contains("data-math-src"), "{html}");
     }
 
-    /// A display formula revealed inside its own paragraph keeps the block shell
-    /// and shows `$$…$$` around the source.
+    /// A display formula expanded by a **sweep** keeps the block shell and shows
+    /// `$$…$$` around the source. (The caret alone never expands it — its only
+    /// positions are the atom's edges, so it would stay source for good; see
+    /// `reveal::covers_block`.)
     #[test]
     fn revealed_display_formula_keeps_its_block() {
         use crate::model::{Pos, Sel};
-        let doc = md::parse("$$\nx+y\n$$");
+        let doc = md::parse("$$\nx+y\n$$\n\n尾");
         let mut e = crate::edit::Editor::new(doc.clone());
-        e.sel = Sel::caret(Pos::new(0, 2));
-        let html = region_fragments_revealed(&doc, DEFAULT_FG, None, 16.0, &e.reveal()).concat();
+        e.sel = Sel {
+            anchor: Pos::new(0, 0),
+            focus: Pos::new(1, 1),
+        };
+        let frags = region_fragments_revealed(&doc, DEFAULT_FG, None, 16.0, &e.reveal());
+        let html = &frags[0];
         assert!(html.contains("data-math-src"), "{html}");
         assert_eq!(html.matches("data-vmark=\"2\"").count(), 2, "{html}");
-        assert_eq!(text_without_markers(&html), doc.blocks[0].plain_text());
+        assert_eq!(text_without_markers(html), doc.blocks[0].plain_text());
+        // The caret inside it does not: the block stays typeset (readable, and
+        // Home/End keep addressing the block).
+        e.sel = Sel::caret(Pos::new(0, 2));
+        let html = region_fragments_revealed(&doc, DEFAULT_FG, None, 16.0, &e.reveal()).concat();
+        assert!(!html.contains("data-math-src"), "{html}");
     }
 
-    /// The **box**, not only the paint: a formula expanded to its LaTeX is not the
-    /// same height as the typeset SVG, so its block keeps the height measured
-    /// before the expansion (`HEIGHT_FLOORS`, installed by the press handler and by
-    /// `apply` when the expansion starts). Without the floor, arrowing onto a tall
-    /// display formula pulled everything below it up on that keystroke and pushed
-    /// it back on the next one.
+    /// The **box**, not only the paint: a block expanded to source is not the same
+    /// height as its typeset form, so it keeps the height measured before the
+    /// expansion (`HEIGHT_FLOORS`, installed by the press handler and by `apply`
+    /// when the expansion starts). Without the floor, sweeping onto a tall display
+    /// formula pulled everything below it up on that keystroke and pushed it back on
+    /// the next one.
     #[test]
     fn a_shown_formula_keeps_its_typeset_height() {
         use crate::model::{Pos, Sel};
@@ -2122,13 +2133,16 @@ mod tests {
         assert_eq!(doc.blocks.len(), 2, "{:?}", doc.blocks);
         let mut e = crate::edit::Editor::new(doc.clone());
         set_height_floors(vec![120.0, 0.0]);
-        // The caret sits in the formula: only the atom is expanded, the block is not.
-        e.sel = Sel::caret(Pos::new(0, 1));
-        assert!(e.reveal().blocks().is_empty());
+        // A sweep (two blocks) expands the formula block — the floor holds its box.
+        e.sel = Sel {
+            anchor: Pos::new(0, 0),
+            focus: Pos::new(1, 1),
+        };
+        assert!(e.reveal().contains(0));
         let html = region_fragments_revealed(&doc, DEFAULT_FG, None, 16.0, &e.reveal()).concat();
         assert!(html.contains("data-math-src"), "{html}");
         assert!(html.contains("min-height:120px"), "{html}");
-        // Away from it the typeset form needs none: its own height is the floor.
+        // Away from it nothing is expanded and no floor is emitted.
         e.sel = Sel::caret(Pos::new(1, 0));
         let html = region_fragments_revealed(&doc, DEFAULT_FG, None, 16.0, &e.reveal()).concat();
         assert!(!html.contains("min-height:120px"), "{html}");
