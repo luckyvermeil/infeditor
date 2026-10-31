@@ -81,6 +81,16 @@ pub fn Button(
     /// set when omitted.
     #[props(default)]
     id: Option<String>,
+    /// Extra inline declarations (caller-owned; appended after the class).
+    ///
+    /// Only needed when a colour must follow a **theme switch made while the
+    /// button is on screen**: a class-only colour is restyled, but blitz keeps
+    /// painting the cached glyph run until the node itself is mutated (see the
+    /// menu captions' colour in `ui/components/titlebar.rs`). The preferences
+    /// popup carries the theme toggle, so its footer button pins the secondary
+    /// foreground inline.
+    #[props(default)]
+    style: Option<String>,
 ) -> Element {
     let _ = theme; // all colors come from the class stylesheet; the theme
                    // argument is kept to stabilize the API
@@ -92,6 +102,7 @@ pub fn Button(
         button {
             class: "{class}",
             id: id,
+            style: style.unwrap_or_default(),
             disabled: disabled.then_some(true),
             onpointerdown: move |evt| {
                 // Must stop_propagation + prevent_default: the scrim of a

@@ -63,6 +63,9 @@ from __future__ import annotations
 
 import time
 
+from PIL import ImageGrab
+
+from infed import clipboard as cb
 from infed.driver import mean_diff, user32, window_title, windows_of_pid, wt
 
 # ---- Geometry (CSS px, same constants as toolbar::layout / csvtable.rs) -----
@@ -697,6 +700,33 @@ def test_theme_switch_from_preferences_repaints_menu_captions(app_factory, work_
     a.click_in_window(pop, 158.0, 44.0)
     time.sleep(0.9)
     assert _uia_has(a, "主题: 浅色", timeout=4.0), "the theme did not switch back to light"
+
+    # The popup **carries the toggle**, so its own chrome must follow too: the
+    # footer button's glyphs and the system title bar (the frame is themed when
+    # the popup is shown; the shell re-applies it on a live switch).
+    s = a.dpi_scale()
+    cl, ct = a.client_origin(pop)
+    # Inner box only (the 1px border would pass a "dark pixel" check on its own):
+    # a followed theme means a light button with dark glyphs.
+    btn = ImageGrab.grab(bbox=(int(cl + 520 * s), int(ct + 369 * s),
+                               int(cl + 563 * s), int(ct + 383 * s))).convert("L")
+    px = sorted(btn.tobytes())
+    lo, mid = px[0], px[len(px) // 2]
+    assert lo < 120 and mid > 180, (
+        f"the preferences Close button did not follow the theme "
+        f"(min={lo}, median={mid}): light button, dark glyphs expected"
+    )
+    wr = cb.window_rect(pop)
+    frame_h = ct - wr[1]
+    if frame_h >= 20:  # a native frame exists on this Windows build
+        bar = ImageGrab.grab(bbox=(
+            int(wr[0] + (wr[2] - wr[0]) * 0.55), int(wr[1] + frame_h * 0.35),
+            int(wr[0] + (wr[2] - wr[0]) * 0.75), int(wr[1] + frame_h * 0.65),
+        )).convert("L")
+        assert bar.getextrema()[1] > 150, (
+            "the system title bar stayed dark over the now-light preferences window"
+        )
+
     # Close the popup (WM_CLOSE, the shell's own close path).
     user32.PostMessageW(wt.HWND(pop), 0x0010, 0, 0)
     time.sleep(0.8)

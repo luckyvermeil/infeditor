@@ -514,6 +514,11 @@ pub fn PrefsWindow() -> Element {
                     label: s.locale.tr(Msg::CommonClose).into_owned(),
                     kind: ui_kit::ButtonKind::Secondary,
                     theme: kit_theme,
+                    // This popup **owns the theme toggle**: a class-only colour
+                    // would keep painting the old theme's glyphs after the
+                    // switch (blitz's cached text run), so pin the secondary
+                    // foreground inline (same reason as the menu captions).
+                    style: Some(format!("color:{};", s.theme.menu_fg)),
                     on_click: move |_| send_cmd(PrefsCmd::Close),
                 }
             }

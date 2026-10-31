@@ -104,6 +104,7 @@ impl ShellApp {
             id,
             popup,
             focus_pending: std::cell::Cell::new(false),
+            title_dark: std::cell::Cell::new(Some(popup.dark())),
             kb_saved: std::cell::Cell::new(None),
         });
         if let Some(v) = self.inner.windows.get_mut(&id) {

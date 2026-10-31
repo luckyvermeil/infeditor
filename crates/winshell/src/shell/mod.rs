@@ -326,6 +326,12 @@ struct ChildWin {
     popup: &'static dyn Popup,
     /// Pending-flush flag (set by window_event, consumed by poll_children)
     focus_pending: std::cell::Cell<bool>,
+    /// Theme last applied to the popup's **system title bar** (`None` until
+    /// shown). `place_show` themes the frame at show time; a theme switch while
+    /// the popup is open must re-apply it, or the frame stays in the old theme
+    /// over the newly themed content (the preferences dialog carries the very
+    /// toggle that changes it). See `poll_children`.
+    title_dark: std::cell::Cell<Option<bool>>,
     /// Bookkeeping for soft-keyboard avoidance:
     /// `Some((original position, last moved-to position))`.
     ///
@@ -1113,7 +1119,21 @@ impl ShellApp {
                 c.popup.flush();
             }
             let id = c.id;
+            let dark = c.popup.dark();
+            let theme_changed = c.title_dark.get() != Some(dark);
             if let Some(v) = self.inner.windows.get_mut(&id) {
+                // The system title bar is themed when the popup is shown. The
+                // theme can flip while it is open (the preferences dialog owns
+                // the toggle): re-apply it, or the frame stays dark over the
+                // newly light content.
+                if v.is_visible && theme_changed {
+                    v.window.set_theme(Some(if dark {
+                        winit::window::Theme::Dark
+                    } else {
+                        winit::window::Theme::Light
+                    }));
+                    self.children[i].title_dark.set(Some(dark));
+                }
                 let polled = v.poll();
                 if polled {
                     let focus = v
