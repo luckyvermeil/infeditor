@@ -356,6 +356,7 @@ pub struct ShellApp {
     /// window the shell creates — the main window in `launch`, popups here.
     /// Without it a window is composited before its first frame: the white
     /// flash this patch exists to prevent.
+    #[cfg_attr(not(windows), allow(dead_code))] // Popups (the only reader) are Windows-only
     bg: Option<[u8; 3]>,
 }
 
