@@ -1054,14 +1054,7 @@ fn push_marker(s: &mut String, text: &str, open: bool) {
 ///
 /// A failure falls back to `<code>`: the content stays visible, and the
 /// formula source is never swallowed.
-fn push_math(
-    s: &mut String,
-    src: &str,
-    display: bool,
-    own_block: bool,
-    fg: &str,
-    px: f32,
-) {
+fn push_math(s: &mut String, src: &str, display: bool, own_block: bool, fg: &str, px: f32) {
     let spec = if display {
         crate::math::MathSpec::block(src, fg, px)
     } else {
