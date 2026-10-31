@@ -302,10 +302,33 @@ impl Block {
         out
     }
 
+    /// Is `off` one of the **two edges** of a display formula (`$$…$$`) that *is*
+    /// this block?
+    ///
+    /// Such a block has no caret position besides the atom's own edges unless the
+    /// user explicitly steps inside it (a double-click lands in the source), so
+    /// the edges keep the typeset form: expanding there would leave the block
+    /// permanently in source — a document that starts with a display formula
+    /// would open as raw LaTeX, the block could never be read, and `Home`/`End`
+    /// would address the LaTeX lines instead of the block (`Enter` then splits the
+    /// block at `$$`). The atom's interior is the edit state and does expand (see
+    /// [`crate::reveal`]).
+    ///
+    /// An *inline* formula alone in a paragraph is not this case: `$x$` is written
+    /// mid-sentence, so its source is the text the user edits.
+    pub fn is_display_block_edge(&self, off: usize) -> bool {
+        if !self.has_math() {
+            return false;
+        }
+        let len = self.plain_len();
+        self.display_math_span_at(off)
+            .is_some_and(|(s, e)| s == 0 && e >= len && (off == s || off == e))
+    }
+
     /// Plain-byte range of the **display** formula (`$$…$$`) that contains `off`,
-    /// if there is one (no allocation; the caret trigger's one exception needs to
-    /// tell a display formula from an inline one at the same offsets).
-    pub fn display_math_span_at(&self, off: usize) -> Option<(usize, usize)> {
+    /// if there is one (no allocation; the edge rule needs to tell a display
+    /// formula from an inline one at the same offsets).
+    fn display_math_span_at(&self, off: usize) -> Option<(usize, usize)> {
         let mut acc = 0usize;
         let mut out = None;
         match self {

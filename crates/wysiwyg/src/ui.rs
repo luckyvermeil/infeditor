@@ -1111,8 +1111,47 @@ pub fn Wysiwyg(
                     cb.call(());
                 }
             },
-            ondoubleclick: move |_evt: MouseEvent| {
+            ondoubleclick: move |evt: MouseEvent| {
                 let Some(h) = handle_sig.read().as_ref().cloned() else { return };
+                // Double-click **inside a display formula** opens its LaTeX in
+                // place: a single click has to keep such a block typeset (its only
+                // caret positions are the atom's own edges — see
+                // `Block::is_display_block_edge`), so this is the explicit "edit
+                // this formula" gesture. The caret lands *inside* the source, which
+                // is what makes the reveal show it; walking out (or clicking
+                // elsewhere) collapses it back to the typeset form.
+                let inside = {
+                    let c = evt.data.client_coordinates();
+                    let ed = editor.read();
+                    Geom::new(h.clone()).math_block_inside_at(c.x as f32, c.y as f32, &ed.doc)
+                };
+                if let Some(p) = inside {
+                    let mut ctx = Ctx {
+                        editor: &mut editor,
+                        overlays: &mut overlays,
+                        handle: h.clone(),
+                        on_edit,
+                        on_caret,
+                        grab,
+                    };
+                    let reveal_before = ctx.editor.read().reveal();
+                    ctx.editor.write().sel = Sel::caret(p);
+                    let sel = ctx.editor.read().sel;
+                    // The source replaces the typeset SVG: the fragment is
+                    // rebuilt, so the caret is restored a frame later (exactly
+                    // like a drag that expands a block).
+                    let g = ctx.geom();
+                    ctx.sync_overlays(&g);
+                    if ctx.editor.read().reveal() != reveal_before {
+                        ctx.deferred_sync(sel);
+                    } else {
+                        ctx.apply_sel_to_blitz(sel);
+                    }
+                    if let Some(cb) = ctx.on_caret.as_ref() {
+                        cb.call(());
+                    }
+                    return;
+                }
                 let mut ctx = Ctx { editor: &mut editor, overlays: &mut overlays, handle: h, on_edit, on_caret, grab };
                 // Table cell: double-click = select the whole cell's content
                 // (aligned with CSV double-click in-place editing — typing

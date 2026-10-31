@@ -2096,9 +2096,9 @@ mod tests {
     }
 
     /// A display formula expanded by a **sweep** keeps the block shell and shows
-    /// `$$…$$` around the source. (The caret alone never expands it — its only
-    /// positions are the atom's edges, so it would stay source for good; see
-    /// `reveal::covers_block`.)
+    /// `$$…$$` around the source; a caret on the block's **edge** keeps it typeset,
+    /// while a caret **inside** (a double-click puts it there) shows the source too.
+    /// See `Block::is_display_block_edge`.
     #[test]
     fn revealed_display_formula_keeps_its_block() {
         use crate::model::{Pos, Sel};
@@ -2113,11 +2113,18 @@ mod tests {
         assert!(html.contains("data-math-src"), "{html}");
         assert_eq!(html.matches("data-vmark=\"2\"").count(), 2, "{html}");
         assert_eq!(text_without_markers(html), doc.blocks[0].plain_text());
-        // The caret inside it does not: the block stays typeset (readable, and
-        // Home/End keep addressing the block).
+        // The **edges** (block start/end) keep the typeset form: Home/End address
+        // the block, and the document opens readable.
+        for off in [0, doc.blocks[0].plain_len()] {
+            e.sel = Sel::caret(Pos::new(0, off));
+            let html =
+                region_fragments_revealed(&doc, DEFAULT_FG, None, 16.0, &e.reveal()).concat();
+            assert!(!html.contains("data-math-src"), "edge {off}: {html}");
+        }
+        // Inside it (the double-click edit state) the source is on.
         e.sel = Sel::caret(Pos::new(0, 2));
         let html = region_fragments_revealed(&doc, DEFAULT_FG, None, 16.0, &e.reveal()).concat();
-        assert!(!html.contains("data-math-src"), "{html}");
+        assert!(html.contains("data-math-src"), "{html}");
     }
 
     /// The **box**, not only the paint: a block expanded to source is not the same

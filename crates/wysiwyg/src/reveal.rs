@@ -204,21 +204,23 @@ impl Reveal {
         // Two allocation-free walks (a click is a hot path): formulas expand at
         // their edges, images only while the caret is inside the alt.
         //
-        // A formula that **is** its block (a display `$$…$$`) is the exception:
-        // the only caret positions such a block has are the atom's own edges, so
-        // expanding it there would leave the block permanently in source — a
-        // document that starts with a display formula would open as raw LaTeX,
-        // the block could never be read, and Home/End would address the LaTeX
-        // lines instead of the block (a `"$$\\n{a}\\n$$"` block has three visual
-        // lines; `End` then stopped at the first one and `Enter` split the block
-        // at its start). It still shows its source when a sweep expands the block.
+        // A formula that **is** its block (a display `$$…$$`) is the exception at
+        // its **edges**: the block's own start/end are the atom's edges, so a
+        // caret there must keep the typeset form — otherwise the block is
+        // permanently source (a document that starts with a display formula opens
+        // as raw LaTeX, the block can never be read, and `Home`/`End` address the
+        // LaTeX lines: a three-line source made `End` stop on the `$$` line and
+        // `Enter` split the block at its start). Its **interior** is the explicit
+        // edit state — a double-click puts the caret there (see `Geom`'s
+        // `math_block_inside_at`) — and then the source is shown and editable
+        // like an inline formula's. A sweep still expands the whole block.
         let off = sel.focus.off;
         if let Some((s, e)) = block
             .math_spans()
             .into_iter()
             .find(|&(s, e)| s <= off && off <= e)
         {
-            if !covers_block(s, e, block.plain_len(), block.display_math_span_at(off)) {
+            if !block.is_display_block_edge(off) {
                 out.atom = Some((blk, s, e));
             }
             return out;
@@ -265,24 +267,6 @@ fn expand_tables(doc: &Doc, blocks: &mut Vec<usize>) {
     blocks.append(&mut extra);
     blocks.sort_unstable();
     blocks.dedup();
-}
-
-/// Whether a formula's plain range **is** its block *and* is a **display**
-/// formula (a `$$…$$` paragraph): every byte of the block belongs to the atom, so
-/// the block has no surrounding text to edit and no caret position that is not one
-/// of the atom's own edges. Such a block keeps its typeset form at the caret (see
-/// [`Reveal::from_editor`]).
-///
-/// An *inline* formula alone in a paragraph is not this case: `$x$` is written
-/// mid-sentence, its source is what the user edits, and a paragraph holding one
-/// inline formula is a normal paragraph.
-fn covers_block(
-    start: usize,
-    end: usize,
-    block_len: usize,
-    display_at: Option<(usize, usize)>,
-) -> bool {
-    start == 0 && end >= block_len && display_at == Some((start, end))
 }
 
 /// The atom of `block` that **contains** `[start, end)` without being covered by
@@ -450,19 +434,25 @@ mod tests {
         assert_eq!(e.reveal().editing_span(0), Some((2, 5)));
     }
 
-    /// A **display formula is its block**: the caret's only positions there are the
-    /// atom's own edges, so expanding it at the caret would leave the block
-    /// permanently in source — the document would open as raw LaTeX and Home/End
-    /// would address the LaTeX lines instead of the block. A sweep still expands it.
+    /// A **display formula is its block**: its edges are the block's own start/end,
+    /// so a caret there keeps the typeset form (the document opens readable and
+    /// `Home`/`End` address the block). The **interior** is the edit state — a
+    /// double-click puts the caret inside — and then the source is on, like an
+    /// inline formula's. A sweep still expands the block whole.
     #[test]
-    fn a_display_formula_keeps_its_typeset_form_at_the_caret() {
+    fn a_display_formula_is_typeset_at_the_caret_but_edits_inside() {
         let mut e = ed("$$\n\\frac{a}{b}\n$$");
         let len = e.doc.blocks[0].plain_len();
-        for off in [0, 1, len / 2, len.saturating_sub(1), len] {
+        for off in [0, len] {
             e.sel = Sel::caret(Pos::new(0, off));
-            assert!(
-                e.reveal().is_empty(),
-                "the caret at {off} expanded the block"
+            assert!(e.reveal().is_empty(), "the edge {off} expanded the block");
+        }
+        for off in [1, len / 2, len.saturating_sub(1)] {
+            e.sel = Sel::caret(Pos::new(0, off));
+            assert_eq!(
+                e.reveal().editing_span(0),
+                Some((0, len)),
+                "the interior {off} must be editable"
             );
         }
         // Two blocks swept: the display formula shows its `$$…$$` like any block.

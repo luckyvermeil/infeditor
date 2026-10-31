@@ -626,6 +626,34 @@ def _caret_logs(a, n: int = 1) -> list[dict]:
     return out
 
 
+def test_display_math_double_click_edits_source(app_factory, work_dir):
+    """A **double-click** inside a display formula opens its LaTeX in place: the
+    caret lands inside the source, so a typed character edits the formula instead
+    of starting a paragraph before it.
+
+    A single click must keep the block typeset (its two caret positions are the
+    formula's own edges, and expanding there would leave the block permanently in
+    source — see `test_display_math_click_and_enter` and
+    `test_display_math_scale_center_and_caret`).
+    """
+    body = "$$\n\\frac{a}{b}\n$$\n\nafter\n"
+    f = _scene(work_dir, body, "dm-edit.md")
+    a = _open(app_factory, f)
+
+    a.double_click_at_css(640.0, 130.0)
+    time.sleep(0.4)
+    a.type_text("Q", click=False, focus=False)
+    time.sleep(0.5)
+    _save_if_dirty(a)
+    d = _disk(f)
+    # One formula, still the first thing in the document, and the Q went **inside**
+    # its source: typing before the `$$` would have produced `Q$$…`.
+    assert d.startswith("$$\n"), f"text was inserted before the formula: {d!r}"
+    assert d.count("$$") == 2, f"the formula was split into two: {d!r}"
+    assert "Q" in d and d.index("Q") < d.rindex("$$"), f"Q is not in the source: {d!r}"
+    assert d.rstrip().endswith("after"), f"the text after the formula moved: {d!r}"
+
+
 def test_display_math_scale_center_and_caret(app_factory, work_dir):
     """Display formula: size follows the font size, horizontally centered, caret hugs the formula's left/right edges (not line start/end)."""
     f = _scene(work_dir, "$$\n\\frac{a}{b}\n$$\n", "dm-scale.md")

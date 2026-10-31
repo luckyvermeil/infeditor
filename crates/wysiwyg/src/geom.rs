@@ -440,6 +440,72 @@ impl Geom {
         })
     }
 
+    /// Double-click inside a **typeset formula that is its block** (a display
+    /// `$$…$$`) → a caret position **strictly inside** its source, proportional to
+    /// the pointer's x within the box.
+    ///
+    /// This is the explicit "edit this formula" gesture. A single click has to
+    /// leave such a block typeset (its two caret positions are the atom's own
+    /// edges, and expanding there would make the block permanently source — see
+    /// `Block::is_display_block_edge`), so the way in is a position that is *not*
+    /// an edge: once the caret is inside, `reveal` shows the LaTeX and the edit
+    /// layer treats it as text (typing, Backspace, ←/→). Leaving the atom — a
+    /// click elsewhere, or walking out — collapses it back to the typeset form.
+    ///
+    /// `None` when the point is not over such a formula, when it is already shown
+    /// as source (its characters are exact then, `pos_at` answers), or when the
+    /// source has no interior character boundary (a one-character formula has no
+    /// "inside").
+    pub fn math_block_inside_at(&self, x: f32, y: f32, model: &Doc) -> Option<Pos> {
+        let doc = self.handle.try_doc()?;
+        if !model.blocks.iter().any(Block::has_math) {
+            return None;
+        }
+        let (dx, dy) = client_to_content(&doc, self.handle.node_id(), x, y);
+        let container = fragment_container(&doc, self.handle.node_id());
+        crate::dom_index::with_index(&doc, container, |idx| {
+            for (_, bid) in idx.order() {
+                let Some(nodes) = idx.math(bid) else { continue };
+                let Some(b) = model.blocks.get(bid) else {
+                    continue;
+                };
+                for (ordinal, &nid) in nodes.iter().enumerate() {
+                    let Some((x0, y0, w, h)) = math_rect(&doc, nid) else {
+                        continue;
+                    };
+                    if w <= 0.0 || dx < x0 || dx > x0 + w || dy < y0 || dy > y0 + h {
+                        continue;
+                    }
+                    // A source-shown formula (`data-math-src`) and a failed-parse
+                    // fallback hold real text: a double-click there is an ordinary
+                    // word selection, not an "open the source" gesture.
+                    if !math_is_atom(&doc, nid) {
+                        continue;
+                    }
+                    let Some(&(start, end)) = b.math_spans().get(ordinal) else {
+                        continue;
+                    };
+                    let len = end.saturating_sub(start);
+                    // Only a formula that **is** its block: an inline formula is
+                    // already editable from its edges, and a shorter one has no
+                    // interior position at all.
+                    if start != 0 || end < b.plain_len() || len < 2 {
+                        continue;
+                    }
+                    let frac = ((dx - x0) / w).clamp(0.0, 1.0);
+                    let rel = ((frac * len as f32).round() as usize).clamp(1, len - 1);
+                    let plain = b.plain_text();
+                    let rel = char_floor(&plain[start..end], rel);
+                    if rel == 0 || rel >= len {
+                        continue;
+                    }
+                    return Some(Pos::new(bid, start + rel));
+                }
+            }
+            None
+        })
+    }
+
     /// Screen point → task checkbox hit (returns the block number).
     ///
     /// The checkbox is an absolutely positioned span outside data-bid
@@ -893,6 +959,18 @@ fn math_is_atom(doc: &BaseDocument, nid: blitz_dom::NodeId) -> bool {
     doc.get_node(nid)
         .and_then(|n| n.data.downcast_element().and_then(atomic_vlen))
         .is_some()
+}
+
+/// The nearest character boundary at or **before** `off` (a byte offset derived
+/// from a pointer fraction can land inside a multi-byte character).
+fn char_floor(s: &str, mut off: usize) -> usize {
+    if off >= s.len() {
+        return s.len();
+    }
+    while off > 0 && !s.is_char_boundary(off) {
+        off -= 1;
+    }
+    off
 }
 
 /// Whether a model block type can accept the caret: `Hr` is a text-less shell
