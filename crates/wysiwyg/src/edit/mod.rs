@@ -452,10 +452,11 @@ impl Editor {
             }
         }
         // The table Tab chain sits outside `may_edit`, but its **last-cell**
-        // branch appends a row and therefore does edit the document. Detect
-        // that by the block count delta instead of assuming every CellNext is
-        // an edit: a plain cell-to-cell Tab used to clear the redo chain.
-        let cell_next = matches!(cmd, Cmd::Table(TableCmd::CellNext));
+        // branch appends a row and therefore does edit the document; `Move` can
+        // also append/insert a paragraph when it leaves a table at the document
+        // edge (see `move_caret`). Detect that by the block count delta instead
+        // of assuming every such command is an edit: a plain cell-to-cell Tab or
+        // arrow used to clear the redo chain.
         let blocks_before = self.doc.blocks.len();
         let pushed = if may_edit {
             self.push_undo(coalesce)
@@ -476,7 +477,7 @@ impl Editor {
             // the user pressed an arrow key, so Ctrl+Y / the Redo button did
             // nothing. Clearing it in `push_undo` instead wiped it for a no-op
             // (a Wrap across blocks, a SetHead on an Html block).
-            let doc_changed = may_edit || (cell_next && self.doc.blocks.len() != blocks_before);
+            let doc_changed = may_edit || self.doc.blocks.len() != blocks_before;
             if doc_changed {
                 log.redo.clear();
             }

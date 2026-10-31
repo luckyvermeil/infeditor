@@ -1005,6 +1005,58 @@ fn move_left_crosses_blocks() {
     assert_eq!(caret(&e), (0, 2));
 }
 
+/// A table that **ends the document** gets the paragraph a word processor always
+/// keeps beside it: → at the last cell's end crosses the border instead of
+/// staying put (the caret used to be stuck inside the table), and Ctrl+Z takes
+/// the paragraph away again.
+#[test]
+fn move_right_leaves_a_trailing_table_into_a_new_paragraph() {
+    let mut e = ed("| a |\n|---|\n| b |\n");
+    assert_eq!(e.doc.blocks.len(), 2, "one header cell + one body cell");
+    at(&mut e, 1, 1);
+    assert!(e.apply(Cmd::Move(Move::Right)));
+    assert_eq!(caret(&e), (2, 0));
+    assert_eq!(e.doc.blocks.len(), 3);
+    assert!(matches!(&e.doc.blocks[2], Block::Para(v) if v.is_empty()));
+
+    // ← returns to the cell; the paragraph stays (it is a real block now)
+    assert!(e.apply(Cmd::Move(Move::Left)));
+    assert_eq!(caret(&e), (1, 1));
+    assert_eq!(e.doc.blocks.len(), 3);
+
+    // the insertion is one undo step
+    assert!(e.undo());
+    assert_eq!(e.doc.blocks.len(), 2);
+}
+
+/// The same at the other end: ← at the first cell of a **leading** table inserts
+/// the paragraph before the table (the table shifts one block to the right).
+#[test]
+fn move_left_leaves_a_leading_table_into_a_new_paragraph() {
+    let mut e = ed("| a |\n|---|\n| b |\n");
+    at(&mut e, 0, 0);
+    assert!(e.apply(Cmd::Move(Move::Left)));
+    assert_eq!(caret(&e), (0, 0));
+    assert_eq!(e.doc.blocks.len(), 3);
+    assert!(matches!(&e.doc.blocks[0], Block::Para(v) if v.is_empty()));
+    assert!(
+        e.doc.blocks[1].is_td(),
+        "the table follows the new paragraph"
+    );
+}
+
+/// A table that already has a paragraph after it is untouched: the arrow moves
+/// into it and no block is added.
+#[test]
+fn move_right_into_the_existing_paragraph_after_a_table() {
+    let mut e = ed("| a |\n|---|\n| b |\n\nafter\n");
+    at(&mut e, 1, 1);
+    assert!(e.apply(Cmd::Move(Move::Right)));
+    assert_eq!(caret(&e), (2, 0));
+    assert_eq!(e.doc.blocks.len(), 3);
+    assert_eq!(plain(&e.doc.blocks[2]), "after");
+}
+
 #[test]
 fn move_word_left_right() {
     let mut e = ed("foo bar");

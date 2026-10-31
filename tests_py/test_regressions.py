@@ -2,7 +2,7 @@
 
 cargo-layer unit/integration regressions already exist (see the #[test]s in
 src/buffer/doc.rs, src/io/file.rs, src/ui/commands/csv.rs, etc.); this file
-only pins ten scenarios that go **through the full GUI pipeline**:
+only pins eleven scenarios that go **through the full GUI pipeline**:
 
 1. Typing after a save must re-dirty the document (doc.rs hpos accounting
    fix — typing merged into an already-saved entry did not mark dirty, so
@@ -55,6 +55,11 @@ only pins ten scenarios that go **through the full GUI pipeline**:
    start (and clicks/arrows in a wrapped line mapped into the formula). The
    carrier is a full-width `inline-block` now. oracle = where a typed marker
    lands after ↓ from the document start (inside the text, not at offset 0).
+11. A table at the document's start/end must let the caret **leave it**: a word
+   processor always keeps a paragraph beside a table, so ← at the first cell
+   inserts it before the table and → at the last cell appends it after — typing
+   then lands outside the table, not inside the cell (`aY` / `dX` before the
+   fix). oracle = the markers' positions in the saved file.
 
 Clicking a self-drawn control: geometry is the **only** source, and every
 geometric click has to prove it landed (see `_click_toolbar_button`). accesskit
@@ -798,4 +803,48 @@ def test_display_math_after_text_keeps_the_paragraph_caret(app_factory, work_dir
     assert 0 < z < len(text), (
         f"↓ from the document start put the caret outside the text (Z at {z}): "
         "the display formula split the paragraph's inline layout"
+    )
+
+
+# ---- 11. Arrows leave a table at the document's edges ----------------------
+
+
+def test_arrows_leave_a_table_at_the_document_edges(app_factory, work_dir):
+    """A table that starts/ends the document still lets the caret out.
+
+    A word processor keeps a paragraph beside a table; without one, ← at the
+    first cell and → at the last cell could not move at all — the caret stayed
+    inside the table and typed text went into the cell (`aY … dX`). The arrows
+    now add that paragraph on demand (one undo step each), so the caret crosses
+    the border and typing lands outside the table.
+    """
+    body = "| a | b |\n|---|---|\n| c | d |\n"
+    f = work_dir / "table-edges.md"
+    f.write_text(body, encoding="utf-8")
+    a = app_factory(files=[f])
+    time.sleep(0.6)
+
+    # → at the last cell's end: a paragraph appears after the table.
+    a.keys("ctrl+end")
+    time.sleep(0.3)
+    a.keys("right")
+    time.sleep(0.4)
+    a.type_text("X", click=False, focus=False)
+    time.sleep(0.4)
+    # ← at the first cell's start: a paragraph appears before the table.
+    a.keys("ctrl+home")
+    time.sleep(0.3)
+    a.keys("left")
+    time.sleep(0.4)
+    a.type_text("Y", click=False, focus=False)
+    time.sleep(0.4)
+    a.keys("ctrl+s")
+    time.sleep(0.7)
+
+    got = f.read_text(encoding="utf-8")
+    assert got.startswith("Y\n\n| a | b |"), (
+        f"← at the first cell did not leave the table (typed into the cell?): {got!r}"
+    )
+    assert "| c | d |\n\nX" in got, (
+        f"→ at the last cell did not leave the table (typed into the cell?): {got!r}"
     )

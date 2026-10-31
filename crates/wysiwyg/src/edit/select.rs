@@ -133,7 +133,7 @@ impl Editor {
         // offsets are real caret positions).
         let edit = self.reveal().editing_span(focus.block);
         let doc = &self.doc;
-        let new = match m {
+        let mut new = match m {
             Move::Left => move_left(doc, focus, edit),
             Move::Right => move_right(doc, focus, edit),
             Move::WordLeft => move_word_left(doc, focus, edit),
@@ -185,7 +185,25 @@ impl Editor {
                 Pos::new(focus.block + 1, 0)
             }
         };
-        if new == focus && (extend || self.sel.collapsed()) {
+        // A table that **starts or ends** the document has no neighbouring block,
+        // so ←/→ at its first/last cell could never leave it — the caret stayed
+        // inside the table. A word processor always keeps a paragraph beside a
+        // table, and the arrows must be able to cross the border (→ at the last
+        // cell lands after the table, ← at the first cell before it). Add that
+        // paragraph on demand: this is the one `Move` branch that edits the
+        // document (like Tab's last-cell row append, it takes its own undo
+        // snapshot). Shift+←/→ only extends a selection and never edits.
+        let mut inserted = false;
+        if new == focus && !extend {
+            if let Some(p) = self.table_edge_paragraph(m, focus) {
+                new = p;
+                inserted = true;
+            }
+        }
+        // `inserted` matters for the **leading** table: the caret stays at
+        // (0, 0) (the new paragraph takes that address), so the "nothing moved"
+        // test would report a no-op even though the document changed.
+        if new == focus && !inserted && (extend || self.sel.collapsed()) {
             return false;
         }
         self.sel.focus = new;
@@ -193,6 +211,35 @@ impl Editor {
             self.sel.anchor = new;
         }
         true
+    }
+
+    /// The paragraph a table needs so the caret can leave it at the document
+    /// edge (see the call site in [`Self::move_caret`]).
+    ///
+    /// `→` at the end of the document's **last** cell appends it; `←` at the
+    /// start of the **first** cell inserts it before the table. Returns the
+    /// caret position on the other side of the border, or `None` when the caret
+    /// is not on a table edge or a block is already there (plain motion handles
+    /// that case and the caller keeps its result).
+    fn table_edge_paragraph(&mut self, m: Move, p: Pos) -> Option<Pos> {
+        let block = self.doc.blocks.get(p.block)?;
+        match m {
+            Move::Right
+                if block.is_td()
+                    && p.off == block.plain_len()
+                    && p.block + 1 == self.doc.blocks.len() =>
+            {
+                self.push_undo(false);
+                self.doc.blocks.push(Block::Para(Vec::new()));
+                Some(Pos::new(p.block + 1, 0))
+            }
+            Move::Left if p.block == 0 && p.off == 0 && block.is_td() => {
+                self.push_undo(false);
+                self.doc.blocks.insert(0, Block::Para(Vec::new()));
+                Some(Pos::new(0, 0))
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn select_all(&mut self) -> bool {
