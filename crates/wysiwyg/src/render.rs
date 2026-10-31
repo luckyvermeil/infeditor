@@ -325,19 +325,14 @@ fn push_block_p(s: &mut String, idx: usize, b: &Block, quote: &str, e: &Emit<'_>
                     // its `$$…$$` line are not the same height, and the difference
                     // moved everything below the formula on every keystroke that
                     // stepped onto it.
-                    //
-                    // No block margin: `MATH_DISPLAY_STYLE` is an inline-block now,
-                    // whose 12px vertical margin **does not collapse** with the
-                    // wrapper's — keeping both would double the spacing around a
-                    // standalone formula.
                     s.push_str(&format!(
                         "<div data-bid=\"{idx}\" style=\"{}\">",
-                        block_style(idx, "margin:0;", e)
+                        block_style(idx, "margin:10px 0;", e)
                     ));
                     if e.reveal.shows_atom(idx, 0..src.len()) {
                         push_math_source(s, src, true);
                     } else {
-                        push_math(s, src, true, e.fg, e.math_px);
+                        push_math(s, src, true, true, e.fg, e.math_px);
                     }
                     s.push_str("</div>");
                     return;
@@ -953,7 +948,11 @@ fn push_inline(
             if shown {
                 push_math_source(s, src, *display);
             } else {
-                push_math(s, src, *display, e.fg, e.math_px);
+                // `own_block: false`: this walk is inside a block that has other
+                // inline content (a formula that *is* its block is handled before
+                // it), so a block-level carrier here would cut the paragraph's
+                // inline layout in two.
+                push_math(s, src, *display, false, e.fg, e.math_px);
             }
         }
         // In-block line break. `\n` must stay inside a **text node** (same
@@ -1039,17 +1038,30 @@ fn push_marker(s: &mut String, text: &str, open: bool) {
 /// as an atom). `px` is the body font size — the block-level scaling is
 /// handled in one place by [`MathSpec`], not pre-multiplied here.
 ///
-/// A `$$…$$` carrier is [`MATH_DISPLAY_STYLE`]: it is an **inline-block of the
-/// full line width**, so a display formula always takes a line of its own (it
-/// cannot share one with text) *without* leaving the paragraph's inline flow.
-/// `display:block` here used to make a block box inside the inline flow:
-/// blitz split the paragraph into an anonymous block plus the formula, the
-/// layout ↔ plain ledger then no longer matched, and the caret could not be
-/// placed in the text before the formula (mouse and arrows both missed).
+/// `own_block` selects the box model of a **display** carrier:
+///
+/// * `true` — the formula is its whole block (the `Block::Para` arm below): a
+///   centred `display:block` box, exactly the block's own start/end caret
+///   behaviour `Home`/`End` rely on.
+/// * `false` — the formula shares its paragraph with text (the source had
+///   `aaa $$…$$` on one line): a **full-width inline-block**. It still cannot
+///   share a line with text (it wraps to a line of its own, centred), but it
+///   stays inside the paragraph's inline flow. `display:block` here put a block
+///   box inside an inline flow: blitz split the paragraph into an anonymous
+///   text block plus the formula, the inline layout no longer covered the atom,
+///   the layout ↔ plain ledger stopped matching, and ↓ collapsed the caret to
+///   the paragraph start — the text before the formula could not be worked with.
 ///
 /// A failure falls back to `<code>`: the content stays visible, and the
 /// formula source is never swallowed.
-fn push_math(s: &mut String, src: &str, display: bool, fg: &str, px: f32) {
+fn push_math(
+    s: &mut String,
+    src: &str,
+    display: bool,
+    own_block: bool,
+    fg: &str,
+    px: f32,
+) {
     let spec = if display {
         crate::math::MathSpec::block(src, fg, px)
     } else {
@@ -1058,7 +1070,11 @@ fn push_math(s: &mut String, src: &str, display: bool, fg: &str, px: f32) {
     match spec.cached() {
         Some(svg) => {
             let style = if display {
-                MATH_DISPLAY_STYLE
+                if own_block {
+                    MATH_DISPLAY_STYLE
+                } else {
+                    MATH_DISPLAY_SHARED_STYLE
+                }
             } else {
                 MATH_STYLE
             };
@@ -1340,21 +1356,29 @@ pub const HR_SOURCE_STYLE: &str = "margin:24px 0;min-height:1.5em;line-height:1.
 /// at (and editing) the source, not the typeset result.
 pub const MATH_SRC_STYLE: &str = "font-family:monospace;font-size:88%;\
      background:rgba(128,128,128,.12);border-radius:3px;";
-/// A block-level formula: occupies its own line, horizontally centered, with
-/// vertical margin (MathJax's display look).
+/// A **formula that is its whole block**: a block-level box, horizontally
+/// centered, with vertical margin (MathJax's display look).
 ///
-/// **`inline-block` at the full line width, not `display:block`**: a block box
-/// inside a paragraph that already has text makes blitz split the paragraph
-/// into an anonymous block plus the formula — the paragraph's inline layout then
-/// no longer covers the atom, the layout ↔ plain ledger stops matching, and the
-/// caret cannot be placed in the text before the formula (clicks and arrows both
-/// miss). As a 100%-wide inline-block it still cannot share a line with text
-/// (it wraps to a line of its own by construction) but stays inside the same
-/// inline context, so the text before it keeps its caret, selection and mouse
-/// mapping.
+/// The block-level box is what gives the formula its own start/end caret
+/// positions (`Home`/`End` address those two and nothing else), so it must stay
+/// a real block here. A formula that shares its paragraph with text must **not**
+/// use this style — see [`MATH_DISPLAY_SHARED_STYLE`].
 /// `text-align` works in blitz's inline layout (table right-alignment is
 /// verified).
 pub const MATH_DISPLAY_STYLE: &str =
+    "display:block;text-align:center;margin:12px 0;line-height:1.2;";
+
+/// A display formula that **shares its paragraph with text** (`aaa $$…$$` on
+/// one source line): a full-width `inline-block`.
+///
+/// It still cannot share a rendered line with text (100% width forces the wrap)
+/// and stays centered, but it remains inside the paragraph's inline flow. As a
+/// `display:block` box it split the paragraph into an anonymous text block plus
+/// the formula: the inline layout no longer covered the atom, the layout ↔ plain
+/// ledger stopped matching, and ↓ from the text collapsed the caret to the
+/// paragraph start (typing landed at offset 0) — the text before the formula
+/// could not be worked with.
+pub const MATH_DISPLAY_SHARED_STYLE: &str =
     "display:inline-block;width:100%;text-align:center;margin:12px 0;line-height:1.2;";
 
 /// Heading text size, relative to the body size: h1..h6 =
@@ -1494,29 +1518,31 @@ mod tests {
         assert!(!html.contains("<svg"), "{html}");
     }
 
-    /// A `$$…$$` that **shares its paragraph with text** keeps the display
-    /// carrier as a **full-line inline-block** — never `display:block`.
+    /// A `$$…$$` that **shares its paragraph with text** uses the full-line
+    /// `inline-block` carrier — never the block one.
     ///
     /// The parser hangs a block-level formula onto the current paragraph
     /// (`Inline::Math { display: true }`). As a block box it split the paragraph
     /// into an anonymous block plus the formula, so the paragraph's inline layout
     /// no longer covered the atom and the layout ↔ plain ledger stopped matching:
-    /// clicks on a wrapped text line landed inside the formula and ↓ did not move
-    /// ("the caret cannot be placed in the text before the formula"). The 100%
-    /// inline-block still takes a line of its own (it cannot share one with
-    /// text) but stays in the same inline context.
+    /// ↓ from the text collapsed the caret to the paragraph start (typed text
+    /// landed at offset 0). The 100% inline-block still takes a line of its own
+    /// (it cannot share one with text) but stays in the same inline context. A
+    /// formula that *is* its block keeps the block carrier: its own start/end
+    /// caret positions (`Home`/`End`) depend on it.
     #[test]
-    fn display_math_carrier_stays_inline_block() {
+    fn shared_display_math_carrier_is_inline_block() {
         let shared = content_html(&md::parse("aaa $$x+1$$\n"));
-        assert!(shared.contains(MATH_DISPLAY_STYLE), "{shared}");
+        assert!(shared.contains(MATH_DISPLAY_SHARED_STYLE), "{shared}");
         assert!(
-            !shared.contains("display:block;text-align:center"),
+            !shared.contains(MATH_DISPLAY_STYLE),
             "a shared paragraph must not carry a block-level formula box: {shared}"
         );
-        assert!(MATH_DISPLAY_STYLE.contains("display:inline-block"));
-        assert!(MATH_DISPLAY_STYLE.contains("width:100%"));
+        assert!(MATH_DISPLAY_SHARED_STYLE.contains("display:inline-block"));
+        assert!(MATH_DISPLAY_SHARED_STYLE.contains("width:100%"));
         let alone = content_html(&md::parse("$$x+1$$\n"));
         assert!(alone.contains(MATH_DISPLAY_STYLE), "{alone}");
+        assert!(!alone.contains(MATH_DISPLAY_SHARED_STYLE), "{alone}");
     }
 
     /// A formula inside a heading must be typeset at the heading's size.
