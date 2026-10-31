@@ -37,7 +37,7 @@ fontique = { git = "https://github.com/linebender/parley", rev = "62790943af982a
 
 [package]
 name = "infeditor"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Text editor built from scratch in Rust with a Dioxus Native (Blitz) UI; Windows first-class, Linux/macOS experimental"
